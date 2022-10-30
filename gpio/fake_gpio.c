@@ -11,10 +11,12 @@
 #include<linux/uaccess.h>
 #include <linux/err.h>
 #include <linux/mutex.h>
+#include <linux/delay.h>
 
 #define GPIO_BUF_SZ        10
 #define DEV_CLASS "fake_gpio_class"
 #define DEV_NAME "fake_gpio"
+#define SYSFS_DIR "fake_gpio_sysfs"
  
 dev_t dev = 0;
 static struct class *dev_class;
@@ -47,6 +49,7 @@ static ssize_t  gpio_mode_get(struct kobject *kobj,
 static ssize_t  gpio_mode_set(struct kobject *kobj, 
                         struct kobj_attribute *attr,const char *buf, size_t count);
 struct kobj_attribute gpio_mode_attr = __ATTR(gpio_mode, 0660, gpio_mode_get, gpio_mode_set);
+void drain_buffer(void);
 
 // File ops structure
 static struct file_operations fops =
@@ -76,57 +79,84 @@ static int fake_gpio_release(struct inode *inode, struct file *file)
         return 0;
 }
 
-// push bytes onto circular buffer, does not overwrite
-size_t buffer_push(const char __user *buf, size_t len) {
-        const char __user *rp;
-        int rc;
-        size_t i;
-        rp = buf;
-        for (i = 0; i < len; i++) {
-                if (buf_count == GPIO_BUF_SZ) {
-                        pr_info("fake_gpio: buffer_push(): buffer full upon writing %ld bytes\n", i);
-                        return i;
-                }
-                rc = copy_from_user(buf_head, rp, 1);
-                if(rc) {
-                        pr_err("fake_gpio: buffer_push() copy_from_user(): ERROR %d!\n", rc);
-                        return i;
-                }
+// push one byte into buffer
+// return 1 if success, 0 if no room available
+// no synchronization, caller must ensure e.g. via mutex
+int buffer_push_one(char data) {
+        if (buf_count < GPIO_BUF_SZ) {
                 buf_count++;
-                rp++;
-                buf_head++;
+                *buf_head++ = data;
                 if (buf_head > buf_end) {
                         buf_head = buf_start; // wraparound
                 }
-                pr_info("fake_gpio: buffer_push() buf_count=%ld, buf_head=%p\n", buf_count, buf_head);
+                pr_info("fake_gpio: buffer_push_one(): data = '%c', buf_count=%ld, buf_head=%p\n", data, buf_count, buf_head);
+        } else {
+                pr_info("fake_gpio: buffer_push_one(): buffer full, cannot push\n");
+                return 0;
+        }
+        return 1;
+}
+
+// push bytes onto circular buffer, does not overwrite
+// no synchronization, caller must ensure e.g. via mutex
+size_t buffer_push(const char __user *buf, size_t len) {
+        const char __user *rp;
+        int rc;
+        char data;
+        size_t i;
+        rp = buf;
+        for (i = 0; i < len; i++) {
+                // copy userspace to kernel space one byte at a time & push to FIFO
+                rc = copy_from_user(&data, rp++, 1);
+                if(rc) {
+                        pr_err("fake_gpio: buffer_push() copy_from_user(): ERROR %d!\n", rc);
+                        break;
+                }
+                if (buffer_push_one(data) == 0) {
+                        pr_info("fake_gpio: buffer_push(): buffer full upon writing %ld bytes\n", i);
+                        break;
+                }
         }
         return i;
 }
 
+// pop one byte off buffer
+// return 0 if empty, 1 if byte was available
+// no synchronization, caller must ensure e.g. via mutex
+int buffer_pop_one(char  *data) {
+        if (buf_count == 0) {
+                pr_info("fake_gpio: buffbuffer_pop_one(): buffer empty\n");
+                return 0;
+        }
+        *data = *buf_tail;
+        buf_count--;
+        buf_tail++;
+        if (buf_tail > buf_end) {
+                buf_tail = buf_start; // wraparound
+        }
+        pr_info("fake_gpio: buffer_pop_one(): data='%c',  buf_count=%ld, buf_tail=%p\n", *data, buf_count, buf_tail);
+        return 1;
+}
+
 // pop bytes off of circular buffer; no underrun allowed
+// no synchronization, caller must ensure e.g. via mutex
 size_t buffer_pop(char __user *buf, size_t len) {
         char *wp;
         int rc;
         size_t i;
+        char data;
         wp = buf;
         pr_info("fake_gpio: buffer_pop(): buf_count= %ld\n", buf_count);
         for (i = 0; i < len; i++) {
-                if (buf_count == 0) {
+                if (!buffer_pop_one(&data)) {
                         pr_info("fake_gpio: buffer_pop(): buffer empty upon reading %ld bytes\n", i);
                         return i;
                 }
-                rc = copy_to_user(wp, buf_tail, 1);
+                rc = copy_to_user(wp++, &data, 1);
                 if(rc) {
                         pr_err("fake_gpio: buffer_pop() copy_to_user(): ERROR %d!\n", rc);
                         return i;
                 }
-                buf_count--;
-                buf_tail++;
-                wp++;
-                if (buf_tail > buf_end) {
-                        buf_tail = buf_start; // wraparound
-                }
-                pr_info("fake_gpio: buffer_pop() buf_count=%ld, buf_tail=%p\n", buf_count, buf_tail);
         }
         return i;
 }
@@ -144,7 +174,7 @@ static ssize_t fake_gpio_read(struct file *filp, char __user *buf, size_t len, l
             pr_err("fake_gpio: fake_gpio_write(): mutex interrupted, err = %d\n", rc);
             return rc;
         }
-        //Copy the data from the kernel space to the user-space
+
         if (buf_count == 0) {
                 pr_info("fake_gpio: fake_gpio_read() - buffer empty, nothing to read\n");
                 mutex_unlock(&buf_mutex);
@@ -153,6 +183,7 @@ static ssize_t fake_gpio_read(struct file *filp, char __user *buf, size_t len, l
 
         rlen = (len < buf_count)?len:buf_count;
         pr_info("fake_gpio: fake_gpio_read() request to read %ld bytes, will actually try to read %ld bytes\n", len, rlen);
+        // finally pop data from internal FIFO buffer
         actual_rlen = buffer_pop(buf, rlen);
         pr_info("fake_gpio: fake_gpio_read(): popped %ld bytes\n", actual_rlen);
         mutex_unlock(&buf_mutex);
@@ -187,10 +218,76 @@ static ssize_t fake_gpio_write(struct file *filp, const char __user *buf, size_t
                 wlen = len;
                 pr_info("fake_gpio: fake_gpio_write() - actually writing %ld bytes\n", wlen);
         }
-        mutex_unlock(&buf_mutex);
+        // finally push data into internal FIFO buffer
         actual_wlen = buffer_push(buf, wlen);
+        mutex_unlock(&buf_mutex);
         pr_info("fake_gpio: pushed %ld bytes\n", actual_wlen);
+        drain_buffer();
         return actual_wlen;
+}
+
+#define WAIT_DLY_MIN_USEC 100000      // .100 sec
+#define WAIT_DLY_MAX_USEC 101000      // .101 sec
+#define BIT_DURATION_MIN_USEC 100000  // .100 sec
+#define BIT_DURATION_MAX_USEC 101000  // .101 sec
+
+char preamble[2] = {0,1}; // bits represented as bytes for simplicity to change
+char postamble[2] = {0,1};
+
+void clear_output(void) {
+        pr_info("fake_gpio: clear_output() sent 0\n");
+}
+
+void set_output(void) {
+        pr_info("fake_gpio: set_output()   sent 1\n");
+}
+
+void send_bit(bool bit) {
+        if (bit) {
+                set_output();
+        } else {
+                clear_output();
+        }
+        usleep_range(BIT_DURATION_MIN_USEC,BIT_DURATION_MAX_USEC);
+}
+
+void send_x_amble(char *data, ssize_t len) {
+        int i;
+        pr_info("fake_gpio: sending framing %ld bits\n", len);
+        for (i = 0; i< len; i++) {
+                send_bit(data[i]);
+        }
+}
+
+void serialize_byte(char data) {
+        int i;
+        pr_info("fake_gpio: serialize_byte 0x%02x\n", data);
+
+        send_x_amble(preamble, sizeof(preamble)/sizeof(preamble[0]));
+        pr_info("fake_gpio: sending data 8 bits\n");
+        for (i = 0; i < 8; i++) {
+                send_bit(data & 1<<i);
+        }
+        send_x_amble(postamble, sizeof(postamble)/sizeof(postamble[0]));
+}
+
+// Drain the buffer & serialize it to FAKE I2C bus
+// https://www.kernel.org/doc/html/latest/timers/timers-howto.html
+void drain_buffer(void) {
+        char data;
+        int rc;
+        bool have_data = true;
+        while (have_data) {
+                mutex_lock(&buf_mutex);
+                rc = buffer_pop_one(&data);
+                mutex_unlock(&buf_mutex);
+                if (rc) {
+                        serialize_byte(data);
+                } else {
+                        have_data = false;
+                        // usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
+                }
+        }
 }
 
 /*
@@ -257,19 +354,19 @@ static int __init fake_gpio_driver_init(void)
         buf_start = gpio_buf;
         buf_end = gpio_buf+GPIO_BUF_SZ-1;
         pr_info("fake_gpio: fake_gpio_driver_init() buf_start=%p, buf_end=%p, buf_head=%p, buf_tail=%p\n", buf_start, buf_end, buf_head, buf_tail);
-    
-        pr_info("fake_gpio: fake_gpio_driver_init(): inserted device %s, class %s, MAJOR=%d, MINOR=%d\n", DEV_NAME, DEV_CLASS, MAJOR(dev), MINOR(dev));
 
         // Create sysfs directory in /sys/kernel/
-        gpio_kobj = kobject_create_and_add("fake_gpio_sysfs",kernel_kobj);
+        gpio_kobj = kobject_create_and_add(SYSFS_DIR,kernel_kobj);
  
         // Create sysfs file node for gpio_mode
         if(sysfs_create_file(gpio_kobj,&gpio_mode_attr.attr)){
                 pr_err("Cannot create sysfs file......\n");
                 goto destroy_sysfs;
         }
+    
+        pr_info("fake_gpio: fake_gpio_driver_init(): inserted device %s, class %s, MAJOR=%d, MINOR=%d sysfs=%s\n",
+                 DEV_NAME, DEV_CLASS, MAJOR(dev), MINOR(dev), SYSFS_DIR);
         return 0;
-
  
 destroy_sysfs:
         kobject_put(gpio_kobj); 
@@ -288,6 +385,8 @@ destroy_chrdev_region:
  */
 static void __exit fake_gpio_driver_exit(void)
 {
+        kobject_put(gpio_kobj); 
+        sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
 	kfree(gpio_buf);
         device_destroy(dev_class,dev);
         class_destroy(dev_class);
