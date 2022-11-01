@@ -12,6 +12,7 @@
 #include <linux/err.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/kthread.h>
 
 #define GPIO_BUF_SZ        10
 #define DEV_CLASS "fake_gpio_class"
@@ -19,24 +20,27 @@
 #define SYSFS_DIR "fake_gpio_sysfs"
  
 dev_t dev = 0;
-static struct class *dev_class;
+static struct class *dev_class = NULL;
 static struct cdev fake_gpio_cdev;
-char *gpio_buf;
-char *buf_head;
-char *buf_tail;
-char *buf_start;
-char *buf_end;
+char *gpio_buf = NULL;
+char *buf_head = NULL;
+char *buf_tail = NULL;
+char *buf_start = NULL;
+char *buf_end = NULL;
 size_t buf_count = 0;
-struct kobject *gpio_kobj;
+struct kobject *gpio_kobj = NULL;
+static struct task_struct *drain_loop_thread = NULL;
+bool drain_loop_thread_running = false;
 
 DEFINE_MUTEX(buf_mutex);
 
 typedef enum gpio_mode_e {
-        FIFO = 0,
-        BITSTREAM =1
+        MODE_FIFO_ONLY = 0,                             // can read and write buffer, no serialzation
+        MODE_SERIALIZE_BLOCKING =1,                     // writes cause draining & serialization; blocking
+        MODE_SERIALIZE_NONBLOCKING_POLLED = 2           // writes cause draining & serialization; non-blocking via polling thread
 } gpio_mode_t;
 
-volatile gpio_mode_t gpio_mode = 0;
+volatile gpio_mode_t gpio_mode = MODE_FIFO_ONLY;
 
 static int      __init fake_gpio_driver_init(void);
 static void     __exit fake_gpio_driver_exit(void);
@@ -48,7 +52,13 @@ static ssize_t  gpio_mode_get(struct kobject *kobj,
                         struct kobj_attribute *attr, char *buf);
 static ssize_t  gpio_mode_set(struct kobject *kobj, 
                         struct kobj_attribute *attr,const char *buf, size_t count);
+static ssize_t  buf_count_get(struct kobject *kobj, 
+                        struct kobj_attribute *attr, char *buf);
+static ssize_t  buf_count_set(struct kobject *kobj, 
+                        struct kobj_attribute *attr,const char *buf, size_t count);
+                        
 struct kobj_attribute gpio_mode_attr = __ATTR(gpio_mode, 0660, gpio_mode_get, gpio_mode_set);
+struct kobj_attribute buf_count_attr = __ATTR(buf_count, 0660, buf_count_get, buf_count_set);
 void drain_buffer(void);
 
 // File ops structure
@@ -125,7 +135,7 @@ size_t buffer_push(const char __user *buf, size_t len) {
 // no synchronization, caller must ensure e.g. via mutex
 int buffer_pop_one(char  *data) {
         if (buf_count == 0) {
-                pr_info("fake_gpio: buffbuffer_pop_one(): buffer empty\n");
+                // pr_info("fake_gpio: buffbuffer_pop_one(): buffer empty\n");
                 return 0;
         }
         *data = *buf_tail;
@@ -222,7 +232,10 @@ static ssize_t fake_gpio_write(struct file *filp, const char __user *buf, size_t
         actual_wlen = buffer_push(buf, wlen);
         mutex_unlock(&buf_mutex);
         pr_info("fake_gpio: pushed %ld bytes\n", actual_wlen);
-        drain_buffer();
+        if (gpio_mode == MODE_SERIALIZE_BLOCKING) {
+                pr_info("fake_gpio: draining buffer (blocking)...\n");
+                drain_buffer();
+        }
         return actual_wlen;
 }
 
@@ -275,23 +288,37 @@ void serialize_byte(char data) {
 // https://www.kernel.org/doc/html/latest/timers/timers-howto.html
 void drain_buffer(void) {
         char data;
-        int rc;
-        bool have_data = true;
-        while (have_data) {
+        int rc = 1;
+        while (rc) {
                 mutex_lock(&buf_mutex);
                 rc = buffer_pop_one(&data);
                 mutex_unlock(&buf_mutex);
                 if (rc) {
                         serialize_byte(data);
-                } else {
-                        have_data = false;
-                        // usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
                 }
         }
 }
+int drain_buffer_thread(void *context) {
+        char data;
+        int rc = 1;
+        pr_info("fake_gpio: drain_buffer_thread(): entered thread\n");
+        drain_loop_thread_running = true;
+        while(!kthread_should_stop()) {
+                mutex_lock(&buf_mutex);
+                rc = buffer_pop_one(&data);
+                mutex_unlock(&buf_mutex);
+                if (rc) {
+                        serialize_byte(data);
+                }
+                usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
+        }
+        drain_loop_thread_running = false;
+        pr_info("fake_gpio: drain_buffer_thread(): leaving thread\n");
+        return 0;
+}
 
 /*
- * sysfsfs mode read op
+ * /sys/kernel/SYSFS_DIR/gpio_mode read op
  */
 static ssize_t gpio_mode_get(struct kobject *kobj, 
                 struct kobj_attribute *attr, char *buf)
@@ -303,7 +330,7 @@ static ssize_t gpio_mode_get(struct kobject *kobj,
 }
 
 /*
- * sysfsfs mode write op
+ * /sys/kernel/SYSFS_DIR/gpio_mode write op
  */
 static ssize_t gpio_mode_set(struct kobject *kobj, 
                 struct kobj_attribute *attr,const char *buf, size_t count)
@@ -311,7 +338,55 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
         ssize_t len;
         len = sscanf(buf,"%d",(int *)(&gpio_mode));
         pr_info("gpio_mode_set() => %d\n", gpio_mode);
+
+        if ( (gpio_mode != MODE_SERIALIZE_NONBLOCKING_POLLED) && \
+                drain_loop_thread ) {
+                        kthread_stop(drain_loop_thread);
+                }
+        switch (gpio_mode) {
+        case MODE_FIFO_ONLY:
+                break;
+
+        case MODE_SERIALIZE_BLOCKING:
+                break;
+
+        case MODE_SERIALIZE_NONBLOCKING_POLLED:
+                if (!drain_loop_thread) {
+                        pr_info("fake_gpio: gpio_mode_set(): Creating kthread...\n");
+                        drain_loop_thread = kthread_create(drain_buffer_thread,NULL,"drain_buffer_thread");
+                }
+                if(drain_loop_thread && ! drain_loop_thread_running) {
+                        // TODO - prevent race condition as thread is about to exit
+                        pr_info("fake_gpio: gpio_mode_set(): waking up thread...\n");
+                        wake_up_process(drain_loop_thread);
+                } else {
+                        pr_err("fake_gpio: gpio_mode_set(): Cannot create kthread\n");
+                }
+                break;
+        }
         return count;
+}
+
+/*
+ * /sys/kernel/SYSFS_DIR/buf_count read op
+ */
+static ssize_t buf_count_get(struct kobject *kobj, 
+                struct kobj_attribute *attr, char *buf)
+{
+        ssize_t len;
+        len = sprintf(buf, "%ld", buf_count);
+        pr_info("buf_count_get() => '%s'\n", buf);
+        return len;
+}
+
+/*
+ * /sys/kernel/SYSFS_DIR/buf_count write op
+ */
+static ssize_t buf_count_set(struct kobject *kobj, 
+                struct kobj_attribute *attr,const char *buf, size_t count)
+{
+        pr_info("buf_count_set() => INVALID, not supported\n");
+        return EINVAL;
 }
 
 /*
@@ -360,7 +435,13 @@ static int __init fake_gpio_driver_init(void)
  
         // Create sysfs file node for gpio_mode
         if(sysfs_create_file(gpio_kobj,&gpio_mode_attr.attr)){
-                pr_err("Cannot create sysfs file......\n");
+                pr_err("Cannot create sysfs/gpio_mode file......\n");
+                goto destroy_sysfs;
+        }
+ 
+        // Create sysfs file node for buf_count
+        if(sysfs_create_file(gpio_kobj,&buf_count_attr.attr)){
+                pr_err("Cannot create sysfs/buf_count file......\n");
                 goto destroy_sysfs;
         }
     
@@ -371,6 +452,7 @@ static int __init fake_gpio_driver_init(void)
 destroy_sysfs:
         kobject_put(gpio_kobj); 
         sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
+        sysfs_remove_file(kernel_kobj, &buf_count_attr.attr);
 
 destroy_device:
         class_destroy(dev_class);
@@ -385,6 +467,9 @@ destroy_chrdev_region:
  */
 static void __exit fake_gpio_driver_exit(void)
 {
+        if (drain_loop_thread_running && drain_loop_thread) {
+                kthread_stop(drain_loop_thread);
+        }
         kobject_put(gpio_kobj); 
         sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
 	kfree(gpio_buf);
