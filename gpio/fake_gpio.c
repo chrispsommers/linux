@@ -13,6 +13,7 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
+#include <linux/sched.h>
 
 #define GPIO_BUF_SZ        10
 #define DEV_CLASS "fake_gpio_class"
@@ -305,13 +306,15 @@ int drain_buffer_thread(void *context) {
         allow_signal(SIGKILL);
         drain_loop_thread_running = true;
         while(!kthread_should_stop()) {
-                mutex_lock(&buf_mutex);
-                rc = buffer_pop_one(&data);
-                mutex_unlock(&buf_mutex);
-                if (rc) {
-                        serialize_byte(data);
+                if (gpio_mode == MODE_SERIALIZE_NONBLOCKING_POLLED) {
+                        mutex_lock(&buf_mutex);
+                        rc = buffer_pop_one(&data);
+                        mutex_unlock(&buf_mutex);
+                        if (rc) {
+                                serialize_byte(data);
+                        }
                 }
-                if (signal_pending(default_task)) // catch sigkill
+                if (signal_pending(drain_loop_thread)) // catch sigkill
                         break;
 
                 usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
@@ -342,33 +345,6 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
         ssize_t len;
         len = sscanf(buf,"%d",(int *)(&gpio_mode));
         pr_info("fake_gpio: gpio_mode_set() => %d\n", gpio_mode);
-
-        if ( (gpio_mode != MODE_SERIALIZE_NONBLOCKING_POLLED) && \
-                drain_loop_thread ) {
-                        pr_info("fake_gpio: gpio_mode_set() stopping thread...\n");
-                        kthread_stop(drain_loop_thread);
-        }
-        switch (gpio_mode) {
-        case MODE_FIFO_ONLY:
-                break;
-
-        case MODE_SERIALIZE_BLOCKING:
-                break;
-
-        case MODE_SERIALIZE_NONBLOCKING_POLLED:
-                if (!drain_loop_thread) {
-                        pr_info("fake_gpio: gpio_mode_set(): Creating kthread...\n");
-                        drain_loop_thread = kthread_create(drain_buffer_thread,NULL,"drain_buffer_thread");
-                }
-                if(drain_loop_thread && ! drain_loop_thread_running) {
-                        // TODO - prevent race condition as thread is about to exit
-                        pr_info("fake_gpio: gpio_mode_set(): waking up thread...\n");
-                        wake_up_process(drain_loop_thread);
-                } else {
-                        pr_err("fake_gpio: gpio_mode_set(): Cannot create kthread\n");
-                }
-                break;
-        }
         return count;
 }
 
@@ -449,6 +425,13 @@ static int __init fake_gpio_driver_init(void)
                 pr_err("Cannot create sysfs/buf_count file......\n");
                 goto destroy_sysfs;
         }
+
+        // start buffer drain thread; only drains if mode is set appropriately
+        pr_info("fake_gpio: gpio_mode_set(): Creating kthread...\n");
+        drain_loop_thread = kthread_create(drain_buffer_thread,NULL,"drain_buffer_thread");
+        pr_info("fake_gpio: gpio_mode_set(): waking up thread...\n");
+        wake_up_process(drain_loop_thread);
+
     
         pr_info("fake_gpio: fake_gpio_driver_init(): inserted device %s, class %s, MAJOR=%d, MINOR=%d sysfs=%s\n",
                  DEV_NAME, DEV_CLASS, MAJOR(dev), MINOR(dev), SYSFS_DIR);
@@ -472,7 +455,7 @@ destroy_chrdev_region:
  */
 static void __exit fake_gpio_driver_exit(void)
 {
-        if (drain_loop_thread_running && drain_loop_thread) {
+        if ( drain_loop_thread) {
                 pr_info("fake_gpio: fake_gpio_driver_exit() stopping thread...\n");
                 kthread_stop(drain_loop_thread);
         }
