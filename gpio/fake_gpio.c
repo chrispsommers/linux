@@ -302,6 +302,7 @@ int drain_buffer_thread(void *context) {
         char data;
         int rc = 1;
         pr_info("fake_gpio: drain_buffer_thread(): entered thread\n");
+        allow_signal(SIGKILL);
         drain_loop_thread_running = true;
         while(!kthread_should_stop()) {
                 mutex_lock(&buf_mutex);
@@ -310,6 +311,9 @@ int drain_buffer_thread(void *context) {
                 if (rc) {
                         serialize_byte(data);
                 }
+                if (signal_pending(default_task)) // catch sigkill
+                        break;
+
                 usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
         }
         drain_loop_thread_running = false;
@@ -337,12 +341,13 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
 {
         ssize_t len;
         len = sscanf(buf,"%d",(int *)(&gpio_mode));
-        pr_info("gpio_mode_set() => %d\n", gpio_mode);
+        pr_info("fake_gpio: gpio_mode_set() => %d\n", gpio_mode);
 
         if ( (gpio_mode != MODE_SERIALIZE_NONBLOCKING_POLLED) && \
                 drain_loop_thread ) {
+                        pr_info("fake_gpio: gpio_mode_set() stopping thread...\n");
                         kthread_stop(drain_loop_thread);
-                }
+        }
         switch (gpio_mode) {
         case MODE_FIFO_ONLY:
                 break;
@@ -468,6 +473,7 @@ destroy_chrdev_region:
 static void __exit fake_gpio_driver_exit(void)
 {
         if (drain_loop_thread_running && drain_loop_thread) {
+                pr_info("fake_gpio: fake_gpio_driver_exit() stopping thread...\n");
                 kthread_stop(drain_loop_thread);
         }
         kobject_put(gpio_kobj); 
