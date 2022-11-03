@@ -30,15 +30,18 @@ char *buf_start = NULL;
 char *buf_end = NULL;
 size_t buf_count = 0;
 struct kobject *gpio_kobj = NULL;
-static struct task_struct *drain_loop_thread = NULL;
-bool drain_loop_thread_running = false;
-
+static struct task_struct *drain_poll_loop_thread = NULL;
+bool drain_poll_loop_thread_running = false;
+static struct task_struct *drain_wait_loop_thread = NULL;
+bool drain_wait_loop_thread_running = false;
+DECLARE_WAIT_QUEUE_HEAD(gpio_buffer_wq);
 DEFINE_MUTEX(buf_mutex);
 
 typedef enum gpio_mode_e {
         MODE_FIFO_ONLY = 0,                             // can read and write buffer, no serialzation
         MODE_SERIALIZE_BLOCKING =1,                     // writes cause draining & serialization; blocking
-        MODE_SERIALIZE_NONBLOCKING_POLLED = 2           // writes cause draining & serialization; non-blocking via polling thread
+        MODE_SERIALIZE_NONBLOCKING_POLLED = 2,          // writes cause draining & serialization; non-blocking via polling thread
+        MODE_SERIALIZE_NONBLOCKING_WAITQ = 3            // writes cause draining & serialization; non-blocking via wait queue
 } gpio_mode_t;
 
 volatile gpio_mode_t gpio_mode = MODE_FIFO_ONLY;
@@ -60,7 +63,7 @@ static ssize_t  buf_count_set(struct kobject *kobj,
                         
 struct kobj_attribute gpio_mode_attr = __ATTR(gpio_mode, 0660, gpio_mode_get, gpio_mode_set);
 struct kobj_attribute buf_count_attr = __ATTR(buf_count, 0660, buf_count_get, buf_count_set);
-void drain_buffer(void);
+void drain_buffer_blocking(void);
 
 // File ops structure
 static struct file_operations fops =
@@ -105,6 +108,7 @@ int buffer_push_one(char data) {
                 pr_info("fake_gpio: buffer_push_one(): buffer full, cannot push\n");
                 return 0;
         }
+        wake_up_interruptible(&gpio_buffer_wq);
         return 1;
 }
 
@@ -235,7 +239,7 @@ static ssize_t fake_gpio_write(struct file *filp, const char __user *buf, size_t
         pr_info("fake_gpio: pushed %ld bytes\n", actual_wlen);
         if (gpio_mode == MODE_SERIALIZE_BLOCKING) {
                 pr_info("fake_gpio: draining buffer (blocking)...\n");
-                drain_buffer();
+                drain_buffer_blocking();
         }
         return actual_wlen;
 }
@@ -273,6 +277,7 @@ void send_x_amble(char *data, ssize_t len) {
         }
 }
 
+// shift bits out LSB first, surrounded by framing
 void serialize_byte(char data) {
         int i;
         pr_info("fake_gpio: serialize_byte 0x%02x\n", data);
@@ -285,42 +290,102 @@ void serialize_byte(char data) {
         send_x_amble(postamble, sizeof(postamble)/sizeof(postamble[0]));
 }
 
-// Drain the buffer & serialize it to FAKE I2C bus
-// https://www.kernel.org/doc/html/latest/timers/timers-howto.html
-void drain_buffer(void) {
+// send a byte out if available; mutex-protected
+int send_one_byte_conditionally(void) {
         char data;
+        int rc = 0;
+        mutex_lock(&buf_mutex);
+        rc = buffer_pop_one(&data);
+        mutex_unlock(&buf_mutex);
+        if (rc) {
+                serialize_byte(data);
+        }
+        return rc;
+}
+
+// Drain the buffer & serialize it to FAKE I2C bus - blocking
+// https://www.kernel.org/doc/html/latest/timers/timers-howto.html
+void drain_buffer_blocking(void) {
+        // char data;
         int rc = 1;
         while (rc) {
-                mutex_lock(&buf_mutex);
-                rc = buffer_pop_one(&data);
-                mutex_unlock(&buf_mutex);
-                if (rc) {
-                        serialize_byte(data);
-                }
+                rc = send_one_byte_conditionally();
+                // mutex_lock(&buf_mutex);
+                // rc = buffer_pop_one(&data);
+                // mutex_unlock(&buf_mutex);
+                // if (rc) {
+                //         serialize_byte(data);
+                // }
         }
 }
-int drain_buffer_thread(void *context) {
-        char data;
-        int rc = 1;
-        pr_info("fake_gpio: drain_buffer_thread(): entered thread\n");
+
+/*
+ * Continuously poll buffer in a thread
+ * Drain a byte at a time if gpio_mode == MODE_SERIALIZE_NONBLOCKING_POLLED
+ */
+int drain_buffer_poll_thread_fn(void *context) {
+        // char data;
+        int rc = 0;
+        pr_info("fake_gpio: drain_buffer_poll_thread_fn(): entered thread\n");
         allow_signal(SIGKILL);
-        drain_loop_thread_running = true;
+        drain_poll_loop_thread_running = true;
         while(!kthread_should_stop()) {
                 if (gpio_mode == MODE_SERIALIZE_NONBLOCKING_POLLED) {
-                        mutex_lock(&buf_mutex);
-                        rc = buffer_pop_one(&data);
-                        mutex_unlock(&buf_mutex);
-                        if (rc) {
-                                serialize_byte(data);
-                        }
+                        rc = send_one_byte_conditionally();
+                        // mutex_lock(&buf_mutex);
+                        // rc = buffer_pop_one(&data);
+                        // mutex_unlock(&buf_mutex);
+                        // if (rc) {
+                        //         serialize_byte(data);
+                        // }
                 }
-                if (signal_pending(drain_loop_thread)) // catch sigkill
+                if (signal_pending(drain_poll_loop_thread)) // catch sigkill
                         break;
 
                 usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
         }
-        drain_loop_thread_running = false;
-        pr_info("fake_gpio: drain_buffer_thread(): leaving thread\n");
+        drain_poll_loop_thread_running = false;
+        pr_info("fake_gpio: drain_buffer_poll_thread_fn(): leaving thread\n");
+        return 0;
+}
+/*
+ * Thread, wait on gpio_mode == MODE_SERIALIZE_NONBLOCKING_POLLED and drain
+  * buffer, otherwise go back to waiting
+ */
+int drain_buffer_wait_thread_fn(void *context) {
+        // char data;
+        gpio_mode_t old_mode = 0;
+        int rc = 0;
+        pr_info("fake_gpio: drain_buffer_wait_thread_fn(): entered thread\n");
+        allow_signal(SIGKILL);
+        drain_wait_loop_thread_running = true;
+        while(!kthread_should_stop()) {
+                pr_info("fake_gpio: drain_buffer_wait_thread_fn(): Waiting ...\n");
+                // Wake up on sigkill, or wait mode && (data to send or mode changed)
+                wait_event_interruptible(gpio_buffer_wq,
+                                                (kthread_should_stop() ||
+                                                ( (gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) &&
+                                                  ( (buf_count > 0) || (gpio_mode != old_mode))
+                                                )
+                                        ) );
+                pr_info("fake_gpio: drain_buffer_wait_thread_fn(): woke up!\n");
+                old_mode = gpio_mode;
+                if(gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) {
+                        rc = send_one_byte_conditionally();
+                        // mutex_lock(&buf_mutex);
+                        // rc = buffer_pop_one(&data);
+                        // mutex_unlock(&buf_mutex);
+                        // if (rc) {
+                        //         serialize_byte(data);
+                        // }
+                }
+                if (signal_pending(drain_wait_loop_thread)) // catch sigkill
+                        break;
+
+                usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
+        }
+        drain_wait_loop_thread_running = false;
+        pr_info("fake_gpio: drain_buffer_wait_thread_fn(): leaving thread\n");
         return 0;
 }
 
@@ -345,6 +410,9 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
         ssize_t len;
         len = sscanf(buf,"%d",(int *)(&gpio_mode));
         pr_info("fake_gpio: gpio_mode_set() => %d\n", gpio_mode);
+        if ((gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) && drain_wait_loop_thread) {
+                wake_up_interruptible(&gpio_buffer_wq);
+        }
         return count;
 }
 
@@ -356,7 +424,7 @@ static ssize_t buf_count_get(struct kobject *kobj,
 {
         ssize_t len;
         len = sprintf(buf, "%ld", buf_count);
-        pr_info("buf_count_get() => '%s'\n", buf);
+        // pr_info("buf_count_get() => '%s'\n", buf);
         return len;
 }
 
@@ -426,12 +494,17 @@ static int __init fake_gpio_driver_init(void)
                 goto destroy_sysfs;
         }
 
-        // start buffer drain thread; only drains if mode is set appropriately
-        pr_info("fake_gpio: gpio_mode_set(): Creating kthread...\n");
-        drain_loop_thread = kthread_create(drain_buffer_thread,NULL,"drain_buffer_thread");
-        pr_info("fake_gpio: gpio_mode_set(): waking up thread...\n");
-        wake_up_process(drain_loop_thread);
+        // start buffer drain polling thread; only drains if mode is set appropriately
+        pr_info("fake_gpio: fake_gpio_driver_init(): Creating drain_poll_loop_thread...\n");
+        drain_poll_loop_thread = kthread_create(drain_buffer_poll_thread_fn,NULL,"drain_buffer_poll_thread_fn");
+        pr_info("fake_gpio: fake_gpio_driver_init(): waking up thread...\n");
+        wake_up_process(drain_poll_loop_thread);
 
+        // start buffer drain wait queue thread; only drains if mode is set appropriately
+        pr_info("fake_gpio: fake_gpio_driver_init(): Creating drain_wait_loop_thread...\n");
+        drain_wait_loop_thread = kthread_create(drain_buffer_wait_thread_fn,NULL,"drain_buffer_wait_thread_fn");
+        pr_info("fake_gpio: fake_gpio_driver_init(): waking up thread...\n");
+        wake_up_process(drain_wait_loop_thread);
     
         pr_info("fake_gpio: fake_gpio_driver_init(): inserted device %s, class %s, MAJOR=%d, MINOR=%d sysfs=%s\n",
                  DEV_NAME, DEV_CLASS, MAJOR(dev), MINOR(dev), SYSFS_DIR);
@@ -455,9 +528,13 @@ destroy_chrdev_region:
  */
 static void __exit fake_gpio_driver_exit(void)
 {
-        if ( drain_loop_thread) {
-                pr_info("fake_gpio: fake_gpio_driver_exit() stopping thread...\n");
-                kthread_stop(drain_loop_thread);
+        if ( drain_poll_loop_thread) {
+                pr_info("fake_gpio: fake_gpio_driver_exit() stopping drain_poll_loop_thread...\n");
+                kthread_stop(drain_poll_loop_thread);
+        }
+        if ( drain_wait_loop_thread) {
+                pr_info("fake_gpio: fake_gpio_driver_exit() stopping drain_wait_loop_thread...\n");
+                kthread_stop(drain_wait_loop_thread);
         }
         kobject_put(gpio_kobj); 
         sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
