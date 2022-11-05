@@ -6,8 +6,8 @@ all: driver utils
 driver:
 	 make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) modules
 
-utils: rgpio
+utils: rgpio flush
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build  M=$(shell pwd) clean
-	rm rgpio
+	rm rgpio flush

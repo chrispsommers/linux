@@ -15,6 +15,7 @@
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include<linux/proc_fs.h>
+#include <linux/ioctl.h>
 
 #define GPIO_BUF_SZ        10
 #define DEV_CLASS "fake_gpio_class"
@@ -22,7 +23,10 @@
 #define SYSFS_DIR "fake_gpio_sysfs"
 #define PROC_DIR "fake_gpio_sysfs"
 #define PROC_ENTRY_NAME "buf_count"
- 
+
+#define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t*)
+#define IOCTL_GPIO_COUNT _IOR('g','b',size_t*)
+
 dev_t dev = 0;
 static struct class *dev_class = NULL;
 static struct cdev fake_gpio_cdev;
@@ -72,6 +76,7 @@ static int      fake_gpio_open(struct inode *inode, struct file *file);
 static int      fake_gpio_release(struct inode *inode, struct file *file);
 static ssize_t  fake_gpio_read(struct file *filp, char __user *buf, size_t len,loff_t * off);
 static ssize_t  fake_gpio_write(struct file *filp, const char *buf, size_t len, loff_t * off);
+static long     gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 static struct file_operations fops =
 {
@@ -79,7 +84,8 @@ static struct file_operations fops =
         .read           = fake_gpio_read,
         .write          = fake_gpio_write,
         .open           = fake_gpio_open,
-        .release        = fake_gpio_release,
+        .unlocked_ioctl = gpio_ioctl,
+        .release        = fake_gpio_release
 };
 
 
@@ -194,6 +200,11 @@ size_t buffer_pop(char __user *buf, size_t len) {
         return i;
 }
 
+// flush buffer - no mutex protection, caller responsible
+void buffer_flush(void) {
+        char data;
+        while (buffer_pop_one(&data));
+}
 /*
  * Read from device file
  */
@@ -476,6 +487,30 @@ static ssize_t fake_gpio_read_proc(struct file *filp, char __user *buffer, size_
 //     return 0;
 // }
 
+static long gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+        pr_info("fake_gpio: gpio_ioctl() : reveived cmd=%d arg=%ld\n", cmd, arg);
+
+         switch(cmd) {
+                case IOCTL_GPIO_FLUSH:
+                        mutex_lock(&buf_mutex);
+                        pr_info("fake_gpio: gpio_ioctl() : flushing buffer of %ld bytes...\n", buf_count);
+                        buffer_flush();
+                        mutex_unlock(&buf_mutex);
+                        break;
+
+                case IOCTL_GPIO_COUNT:
+                        if( copy_to_user((size_t*) arg, &buf_count, sizeof(buf_count)) )
+                        {
+                                pr_err("fake_gpio: gpio_ioctl() : ERROR copying to user\n");
+                        }
+                        break;
+                default:
+                        pr_info("fake_gpio: gpio_ioctl() : Unknown ioctl call %d, IGNORED\n", cmd);
+                        break;
+        }
+        return 0;
+}
 /*
  * Module insert
  */
@@ -594,7 +629,8 @@ static void __exit fake_gpio_driver_exit(void)
         }
         
         kobject_put(gpio_kobj); 
-        remove_proc_entry(PROC_ENTRY_NAME, gpio_proc_root); 
+        proc_remove(gpio_proc_root);
+        // remove_proc_entry(PROC_ENTRY_NAME, gpio_proc_root); 
         sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
 	kfree(gpio_buf);
         device_destroy(dev_class,dev);
