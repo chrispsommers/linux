@@ -4,13 +4,15 @@ on:
   push:
     branches: [ "**" ]
     paths:
-      - 'gpio'
       - '.github/workflows/ci.yml'
+      - './Makefile'
+      - 'gpio'
   pull_request:
     branches: [ "**" ]
     paths:
-      - 'gpio'
       - '.github/workflows/ci.yml'
+      - './Makefile'
+      - 'gpio'
   workflow_dispatch:
 
 jobs:
@@ -23,7 +25,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Install prerequisites
-      run:  sudo apt update && sudo apt install -y build-essential
+      run:  sudo apt update && sudo apt install -y build-essential python3 python3-pip pytest
     - name: build gpio code
-      run:  make -C gpio all
+      run:  make all
       
