@@ -16,7 +16,6 @@
 #include <linux/sched.h>
 #include<linux/proc_fs.h>
 #include <linux/ioctl.h>
-#include <libgen.h>
 
 #define KLOG_INFO(fmt,...) \
         pr_info("%s: %s()-%d: " fmt, __FILE__, __FUNCTION__, __LINE__, ##__VA_ARGS__ )

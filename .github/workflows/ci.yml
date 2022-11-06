@@ -6,13 +6,13 @@ on:
     paths:
       - '.github/workflows/ci.yml'
       - './Makefile'
-      - 'gpio'
+      - 'gpio/**'
   pull_request:
     branches: [ "**" ]
     paths:
       - '.github/workflows/ci.yml'
       - './Makefile'
-      - 'gpio'
+      - 'gpio/**'
   workflow_dispatch:
 
 jobs:
