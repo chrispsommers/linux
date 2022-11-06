@@ -1,0 +1,29 @@
+name: LINUX-CI
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - 'gpio'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [ "**" ]
+    paths:
+      - 'gpio'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and test code
+    runs-on: ubuntu-20.04
+    defaults:
+      run:
+        working-directory: .
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install prerequisites
+      run:  sudo apt update && sudo apt install -y build-essential
+    - name: build gpio code
+      run:  make -C gpio all
+      
