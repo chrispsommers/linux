@@ -19,4 +19,9 @@ clean: $(SUBDIRS)
 	$(call FOREACH,clean)
 
 
+install-requirements:
+	sudo apt update
+	sudo apt install -y build-essential python3 python3-pip
+	pip3 install -r requirements.txt
+	
 .PHONY: all $(SUBDIRS)
