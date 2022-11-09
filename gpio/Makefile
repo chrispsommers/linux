@@ -10,7 +10,7 @@ utils: rgpio flush
 
 .PHONY: test
 test:
-	python3 -m pytest -s
+	sudo python3 -m pytest -s
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build  M=$(shell pwd) clean
