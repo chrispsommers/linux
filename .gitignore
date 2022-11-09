@@ -5,3 +5,5 @@
 *.symvers
 *.order
 *.cmd
+*.pyc
+__pycache__/
