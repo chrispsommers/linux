@@ -18,6 +18,7 @@ all: $(SUBDIRS)
 clean: $(SUBDIRS)
 	$(call FOREACH,clean)
 
+.PHONY: test
 test:
 	$(call FOREACH,test)
 

@@ -8,10 +8,9 @@ driver:
 
 utils: rgpio flush
 
+.PHONY: test
 test:
-	sudo insmod fake_gpio.ko
-	sudo rmmod fake_gpio
-	sudo dmesg |grep fake_gpio
+	python3 -m pytest -s
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build  M=$(shell pwd) clean
