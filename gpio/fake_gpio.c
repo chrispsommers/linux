@@ -27,8 +27,9 @@
 #define DEV_CLASS "fake_gpio_class"
 #define DEV_NAME "fake_gpio"
 #define SYSFS_DIR "fake_gpio_sysfs"
-#define PROC_DIR "fake_gpio_sysfs"
-#define PROC_ENTRY_NAME "buf_count"
+#define PROC_DIR "fake_gpio_procfs"
+#define PROC_BUF_COUNT_NAME "buf_count"
+#define PROC_GPIO_MODE_NAME "gpio_mode"
 
 #define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t*)
 #define IOCTL_GPIO_COUNT _IOR('g','b',size_t*)
@@ -50,7 +51,8 @@ bool drain_wait_loop_thread_running = false;
 DECLARE_WAIT_QUEUE_HEAD(gpio_buffer_wq);
 DEFINE_MUTEX(buf_mutex);
 static struct proc_dir_entry *gpio_proc_root;
-bool gpio_proc_read_done = false;
+bool proc_read_buf_count_done = false;
+bool proc_read_gpio_mode_done = false;
 
 
 typedef enum gpio_mode_e {
@@ -95,18 +97,31 @@ static struct file_operations fops =
 };
 
 
-// procfs operation callbacks & structure
-static int      fake_gpio_open_proc(struct inode *inode, struct file *file);
-static int      fake_gpio_release_proc(struct inode *inode, struct file *file);
-static ssize_t  fake_gpio_read_proc(struct file *filp, char __user *buffer, size_t length,loff_t * offset);
-// static ssize_t  fake_gpio_write_proc(struct file *filp, const char *buff, size_t len, loff_t * off);
+// procfs buf_count operation callbacks & structure
+static int      fake_gpio_buf_count_open_proc(struct inode *inode, struct file *file);
+static int      fake_gpio_buf_count_release_proc(struct inode *inode, struct file *file);
+static ssize_t  fake_gpio_buf_count_read_proc(struct file *filp, char __user *buffer, size_t length,loff_t * offset);
+// static ssize_t  fake_gpio_buf_count_write_proc(struct file *filp, const char *buff, size_t len, loff_t * off);
 
-static struct proc_ops proc_fops = {
-        .proc_open = fake_gpio_open_proc,
-        .proc_read = fake_gpio_read_proc,
-        // .proc_write = fake_gpio_write_proc,
+static struct proc_ops proc_buf_count_fops = {
+        .proc_open = fake_gpio_buf_count_open_proc,
+        .proc_read = fake_gpio_buf_count_read_proc,
+        // .proc_write = fake_gpio_buf_count_write_proc,
         .proc_write = NULL, // no writes
-        .proc_release = fake_gpio_release_proc
+        .proc_release = fake_gpio_buf_count_release_proc
+}; 
+
+// procfs gpio_mode operation callbacks & structure
+static int      fake_gpio_gpio_mode_open_proc(struct inode *inode, struct file *file);
+static int      fake_gpio_gpio_mode_release_proc(struct inode *inode, struct file *file);
+static ssize_t  fake_gpio_gpio_mode_read_proc(struct file *filp, char __user *buffer, size_t length,loff_t * offset);
+static ssize_t  fake_gpio_gpio_mode_write_proc(struct file *filp, const char *buff, size_t len, loff_t * off);
+
+static struct proc_ops proc_gpio_mode_fops = {
+        .proc_open = fake_gpio_gpio_mode_open_proc,
+        .proc_read = fake_gpio_gpio_mode_read_proc,
+        .proc_write = fake_gpio_gpio_mode_write_proc,
+        .proc_release = fake_gpio_gpio_mode_release_proc
 }; 
 
 // Open device file
@@ -372,7 +387,7 @@ int drain_buffer_poll_thread_fn(void *context) {
         return 0;
 }
 /*
- * Thread, wait on gpio_mode == MODE_SERIALIZE_NONBLOCKING_POLLED and drain
+ * Thread, wait on gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ and drain
   * buffer, otherwise go back to waiting
  */
 int drain_buffer_wait_thread_fn(void *context) {
@@ -426,7 +441,7 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
 {
         ssize_t len;
         len = sscanf(buf,"%d",(int *)(&gpio_mode));
-        KLOG_INFO(" => %d\n", gpio_mode);
+        KLOG_INFO(" => '%d'\n", gpio_mode);
         if ((gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) && drain_wait_loop_thread) {
                 wake_up_interruptible(&gpio_buffer_wq);
         }
@@ -453,46 +468,96 @@ static ssize_t buf_count_set(struct kobject *kobj,
         return EINVAL;
 }
 
+//================================================
+//======== /proc/fake_gpio_procfs/buf_count
+//================================================
+
 // Open procfs file
-static int fake_gpio_open_proc(struct inode *inode, struct file *file)
+static int fake_gpio_buf_count_open_proc(struct inode *inode, struct file *file)
 {
-    KLOG_INFO("proc file opened.....\n");
-    gpio_proc_read_done = false;
+    KLOG_INFO("/proc/%s/%s opened", PROC_DIR, PROC_BUF_COUNT_NAME);
+    proc_read_buf_count_done = false;
     return 0;
 }
 
 // close the procfs file
-static int fake_gpio_release_proc(struct inode *inode, struct file *file)
+static int fake_gpio_buf_count_release_proc(struct inode *inode, struct file *file)
 {
-    KLOG_INFO("file released.....\n");
+    KLOG_INFO("/proc/%s/%s released", PROC_DIR, PROC_BUF_COUNT_NAME);
     return 0;
 }
 
 // Read the procfs file
-static ssize_t fake_gpio_read_proc(struct file *filp, char __user *buffer, size_t length,loff_t * offset)
+static ssize_t fake_gpio_buf_count_read_proc(struct file *filp, char __user *buffer, size_t length,loff_t * offset)
 {
         ssize_t len;
         ssize_t minlen;
         char local_buf[16];
-        if (gpio_proc_read_done) return 0;
+        if (proc_read_buf_count_done) return 0;
         len = sprintf(local_buf, "%ld", buf_count);        
         minlen = (length < len?length:len);
         if( copy_to_user(buffer,local_buf,minlen) ) {
             KLOG_ERR("copy_to_user_error\n");
         }
-        KLOG_INFO(" => %s\n", local_buf);
-        gpio_proc_read_done = true;
-        return length;
+        KLOG_INFO("read => '%s'\n", local_buf);
+        proc_read_buf_count_done = true;
+        return minlen;
+}
+
+//================================================
+//======== /proc/fake_gpio_procfs/gpio_mode
+//================================================
+// Open procfs file
+static int fake_gpio_gpio_mode_open_proc(struct inode *inode, struct file *file)
+{
+        KLOG_INFO("/proc/%s/%s opened", PROC_DIR, PROC_GPIO_MODE_NAME);
+        proc_read_gpio_mode_done = false;
+        return 0;
+}
+
+// close the procfs file
+static int fake_gpio_gpio_mode_release_proc(struct inode *inode, struct file *file)
+{
+        KLOG_INFO("/proc/%s/%s released", PROC_DIR, PROC_GPIO_MODE_NAME);
+        return 0;
+}
+
+// Read the procfs file
+static ssize_t fake_gpio_gpio_mode_read_proc(struct file *filp, char __user *buffer, size_t length,loff_t * offset)
+{
+        ssize_t len;
+        ssize_t minlen;
+        char local_buf[16];
+        if (proc_read_gpio_mode_done) return 0;
+        len = sprintf(local_buf, "%d", gpio_mode);        
+        minlen = (length < len?length:len);
+        if( copy_to_user(buffer,local_buf,minlen) ) {
+            KLOG_ERR("copy_to_user_error\n");
+        }
+        KLOG_INFO("read => '%s'\n", local_buf);
+        proc_read_gpio_mode_done = true;
+        return minlen;
 }
 
 // Write the fake_gpio_procfs file
-// static ssize_t fake_gpio_write_proc(struct file *filp, const char *buff, size_t len, loff_t * off)
-// {
-//     pr_info("proc file write - ingored.....\n");
-    
-//     return 0;
-// }
+static ssize_t fake_gpio_gpio_mode_write_proc(struct file *filp, const char *buff, size_t len, loff_t * off)
+{
+        char local_buf[16];
+        if (copy_from_user(local_buf,buff,len) ) {
+            KLOG_ERR("copy_to_user_error\n");
+            return 0;
+        }
+        if (sscanf(local_buf, "%d", (int *)(&gpio_mode)) != 1) {
+            KLOG_ERR("sscanf error\n");
+            return 0;
+        }
+        KLOG_INFO("write => '%d'\n", gpio_mode);
+        return len;
+}
 
+//================================================
+//=========== ioctl
+//================================================
 static long gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
         KLOG_INFO("received cmd=%d arg=%ld\n", cmd, arg);
@@ -522,6 +587,7 @@ static long gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  */
 static int __init fake_gpio_driver_init(void)
 {
+        struct proc_dir_entry *proc_entry;
         // Get dynamic Major char dev number
         if((alloc_chrdev_region(&dev, 0, 1, DEV_NAME)) <0){
                 KLOG_ERR("Cannot allocate major number\n");
@@ -575,18 +641,30 @@ static int __init fake_gpio_driver_init(void)
 
         // Create proc directory
         // https://www.cs.cmu.edu/afs/grand.central.org/archive/twiki/pub/Main/SumitKumar/procfs-guide.pdf
+        // https://github.com/torvalds/linux/blob/master/include/linux/proc_fs.h
         gpio_proc_root = proc_mkdir(PROC_DIR,NULL);
         
         if( gpio_proc_root == NULL )
         {
-            KLOG_ERR("Error creating proc entry /proc/%s/%s", PROC_DIR, PROC_ENTRY_NAME);
+            KLOG_ERR("Error creating proc directory /proc/%s/", PROC_DIR);
             goto destroy_sysfs;
         }
         
         // Create /proc/fake_gpio/buf_count as read-only
-        // Compare to create_proc_read_entry
-        proc_create(PROC_ENTRY_NAME, 0444, gpio_proc_root, &proc_fops);
-        KLOG_INFO("Created proc entry /proc/%s/%s", PROC_DIR, PROC_ENTRY_NAME);
+        proc_entry = proc_create(PROC_BUF_COUNT_NAME, 0444, gpio_proc_root, &proc_buf_count_fops);
+        if (!proc_entry) {
+            KLOG_ERR("Error creating proc entry /proc/%s/%s", PROC_DIR, PROC_BUF_COUNT_NAME);
+            goto destroy_proc_entry;
+        }
+        KLOG_INFO("Created proc entry /proc/%s/%s", PROC_DIR, PROC_BUF_COUNT_NAME);
+        
+        // Create /proc/fake_gpio/gpio_mode as read-write
+        proc_entry = proc_create(PROC_GPIO_MODE_NAME, 0666, gpio_proc_root, &proc_gpio_mode_fops);
+        if (!proc_entry) {
+            KLOG_ERR("Error creating proc entry /proc/%s/%s", PROC_DIR, PROC_GPIO_MODE_NAME);
+            goto destroy_proc_entry;
+        }
+        KLOG_INFO("Created proc entry /proc/%s/%s", PROC_DIR, PROC_GPIO_MODE_NAME);
 
         // start buffer drain polling thread; only drains if mode is set appropriately
         KLOG_INFO("Creating drain_poll_loop_thread...\n");
@@ -604,8 +682,8 @@ static int __init fake_gpio_driver_init(void)
                  DEV_NAME, DEV_CLASS, MAJOR(dev), MINOR(dev), SYSFS_DIR);
         return 0;
  
-// destroy_proc_entry:
-//         remove_proc_entry(PROC_ENTRY_NAME, gpio_proc_root); 
+destroy_proc_entry:
+        remove_proc_entry(PROC_BUF_COUNT_NAME, gpio_proc_root); 
 
 destroy_sysfs:
         kobject_put(gpio_kobj); 
@@ -636,7 +714,7 @@ static void __exit fake_gpio_driver_exit(void)
         
         kobject_put(gpio_kobj); 
         proc_remove(gpio_proc_root);
-        // remove_proc_entry(PROC_ENTRY_NAME, gpio_proc_root); 
+        // remove_proc_entry(PROC_BUF_COUNT_NAME, gpio_proc_root); 
         sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
 	kfree(gpio_buf);
         device_destroy(dev_class,dev);
