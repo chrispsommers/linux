@@ -16,6 +16,7 @@ procfs = '/proc/%s' % procfsname
 procfs_buf_count = '%s/buf_count' % procfs
 procfs_gpio_mode = '%s/gpio_mode' % procfs
 
+# absolute path to build kernel module
 modpath = os.path.realpath(os.path.dirname(__file__))+'/../%s.ko' % kmodule
 print ('modpath=',modpath)
 
@@ -25,9 +26,103 @@ _IOCTL_GPIO_FLUSH = ioctl_opt.IOW(ord('g'), ord('f'), ctypes.c_void_p)
 #define IOCTL_GPIO_COUNT _IOR('g','b',size_t *)
 _IOCTL_GPIO_COUNT = ioctl_opt.IOR(ord('g'), ord('b'), ctypes.c_void_p)
 
+# =================== HELPERS ======================
+def call_os_cmd(cmd):
+    print ("  Calling '%s' ..." % cmd)
+    return subprocess.check_output(cmd.split(' '), universal_newlines=True)
 
-def call_os_cmd(cmd_string):
-    return subprocess.check_output(cmd_string.split(' '), universal_newlines=True)
+def read_sysfs_buf_count():
+    return int(call_os_cmd('cat %s' % sysfs_buf_count))
+
+def read_sysfs_gpio_mode():
+    return int(call_os_cmd('cat %s' % sysfs_gpio_mode))
+
+def read_procfs_buf_count():
+    return int(call_os_cmd('cat %s' % procfs_buf_count))
+
+def read_procfs_gpio_mode():
+    return int(call_os_cmd('cat %s' % procfs_gpio_mode))
+
+def ioctl_cmd(fo, cmd, value):
+        v = eval(cmd)
+        print('  calling IOCTL(%s=%d) ...' % (cmd, v))
+        rc = fcntl.ioctl(fo, eval(cmd), value, True)
+        assert (rc == 0)
+        # print ('  value=', value)
+        return value.value
+
+def read_ioctl_buf_count(fo = None):
+    '''
+    IOCTL read buffer count
+    if fo is None, open file on demand as R-O then close  
+    '''
+    buf_count = ctypes.c_size_t()
+    if fo:
+        return ioctl_cmd(fo, '_IOCTL_GPIO_COUNT', buf_count)
+    else:
+        fd = os.open(dev, os.O_WRONLY)
+        assert (fd is not None)
+        with os.fdopen(fd, 'w') as fo:
+            assert(fo is not None)
+            return ioctl_cmd(fo, '_IOCTL_GPIO_COUNT', buf_count)
+
+def write_ioctl_gpio_flush(fo = None):
+    '''
+    IOCTL read buffer count
+    if fo is None, open file on demand as W-O then close  
+    '''
+    dummy_int_arg = ctypes.c_int32()
+    if fo:
+        return ioctl_cmd(fo, '_IOCTL_GPIO_FLUSH', dummy_int_arg)
+    else:
+        fd = os.open(dev, os.O_WRONLY)
+        assert (fd is not None)
+        with os.fdopen(fd, 'w') as fo:
+            assert(fo is not None)
+            return ioctl_cmd(fo, '_IOCTL_GPIO_FLUSH', dummy_int_arg)
+
+def write_gpio_buffer(data):
+    fd = os.open(dev, os.O_WRONLY)
+    assert (fd is not None)
+
+    # print('Verify getting file descriptor for %s' % dev)
+    with os.fdopen(fd, 'w') as fo:
+        assert(fo is not None)
+        data_len = len(data)
+        print("  Write '%s' to device (%d chars)" % (data, data_len))
+        return fo.write(data)
+
+
+def read_gpio_buffer():
+    fd = os.open(dev, os.O_RDONLY)
+    assert (fd is not None)
+
+    # print('Verify getting file descriptor for %s' % dev)
+    with os.fdopen(fd, 'r') as fo:
+        assert(fo is not None)
+        result = fo.read()
+        print ("  Read %d bytes: '%s'" % (len(result), result))
+        return result
+
+def assert_buf_count_multi(expected):
+
+    print('Verify buf_count == %d via sysfs' % expected)
+    assert(read_sysfs_buf_count() == expected)
+
+    print('Verify buf_count == %d via procfs' % expected)
+    assert(read_procfs_buf_count() == expected)
+
+    print('Verify buf_count == %d via ioctl' % expected)
+    assert (read_ioctl_buf_count() == expected)
+
+def assert_gpio_mode_multi(expected):
+    print('Verify gpio mode == %d via sysfs' % expected)
+    assert(read_sysfs_gpio_mode() == expected)
+
+    print('Verify gpio mode == %d via procfs' % expected)
+    assert(read_procfs_gpio_mode() == expected)    
+
+# =================== TESTS ======================
 
 def test_initial_conditions():
     buf_count = ctypes.c_size_t()
@@ -53,95 +148,31 @@ def test_initial_conditions():
     print("Checking existence of", procfs_gpio_mode)
     assert(os.path.exists(procfs_gpio_mode))
 
-    print('Verify default gpio mode reading %s == 0' % sysfs_gpio_mode)
-    result = call_os_cmd('cat %s' % sysfs_gpio_mode)
-    assert(result=='0')
+    assert_gpio_mode_multi(0)
+    assert_buf_count_multi(0)
 
-    print('Verify buf_count reading %s == 0' % sysfs_buf_count)
-    result = call_os_cmd('cat %s' % sysfs_buf_count)
-    assert(result=='0')
-
-    print('Verify default gpio mode reading %s == 0' % procfs_gpio_mode)
-    result = call_os_cmd('cat %s' % procfs_gpio_mode)
-    assert(result=='0')
-
-    print('Verify buf_count reading %s == 0' % procfs_buf_count)
-    result = call_os_cmd('cat %s' % procfs_buf_count)
-    assert(result=='0')
-
-    # device file operations
-    print('Verify opening %s' % dev)
-    fd = os.open(dev, os.O_RDWR)
-    assert (fd is not None)
-
-    print('Verify getting file descriptor for %s' % dev)
-    fo = os.fdopen(fd)
-    assert(fo is not None)
-
-    print('Verify ioctl read of buf_count == 0')
-    rc = fcntl.ioctl(fo, _IOCTL_GPIO_COUNT, buf_count, True)
-    assert (rc == 0)
-    print ('buf_count=', buf_count)
-    assert (buf_count.value == 0)
-
-    print('Verify closing %s' % dev)
-    rc = fo.close()
-    assert (rc is None)
-
-# @pytest.mark.skip("WIP")
 def test_mode_0():
-    buf_count = ctypes.c_size_t()
-    dummy_int_arg = ctypes.c_int32()
+    # Ensure clean starting condition
+    print('Flush buffer using IOCTL_GPIO_FLUSH')
+    assert (write_ioctl_gpio_flush() == 0)
+    assert (read_ioctl_buf_count() == 0)
 
-    # device file operations
-    print('Verify opening %s' % dev)
-    fd = os.open(dev, os.O_RDWR)
-    assert (fd is not None)
+    data='12345'
+    data_len = len(data)
+    print ("Write data then flush")
+    assert(write_gpio_buffer(data) == data_len)
+    assert_buf_count_multi(data_len)
 
-    print('Verify getting file descriptor for %s' % dev)
-    with os.fdopen(fd, 'w') as fo:
-        assert(fo is not None)
+    print('Flush buffer using IOCTL_GPIO_FLUSH')
+    assert (write_ioctl_gpio_flush() == 0)
 
-        print('Verify ioctl read of buf_count == 0')
-        rc = fcntl.ioctl(fo, _IOCTL_GPIO_COUNT, buf_count, True)
-        assert (rc == 0)
-        print ('buf_count=', buf_count)
-        assert (buf_count.value == 0)
+    assert_buf_count_multi(0)
 
-        val='12345'
-        l = len(val)
-        print("Write '%s' to device (%d chars)" % (val, l))
-        rc = fo.write(val)
-        assert (rc == l)
+    # write data, read back
+    print ("Write data")
+    assert(write_gpio_buffer(data) == data_len)
+    assert_buf_count_multi(data_len)
 
-    fd = os.open(dev, os.O_RDWR)
-    assert (fd is not None)
-    with os.fdopen(fd, 'w') as fo:
-        assert(fo is not None)
-        print('Verify ioctl read of buf_count == %d' % l)
-        rc = fcntl.ioctl(fo, _IOCTL_GPIO_COUNT, buf_count, True)
-        print ('buf_count=', buf_count)
-        assert (rc == 0)
-        assert (buf_count.value == l)
-
-    print('Verify buf_count reading %s == %d' % (procfs_buf_count, l))
-    result = call_os_cmd('cat %s' % procfs_buf_count)
-    assert(result=='%s'%l)
-
-    print('Verify buf_count reading %s == %d' % (sysfs_buf_count, l))
-    result = call_os_cmd('cat %s' % sysfs_buf_count)
-    assert(result=='%s'%l)
-
-    fd = os.open(dev, os.O_RDWR)
-    assert (fd is not None)
-    with os.fdopen(fd, 'w') as fo:
-        assert(fo is not None)
-        print('Flush buffer using IOCTL_GPIO_FLUSH')
-        rc = fcntl.ioctl(fo, _IOCTL_GPIO_FLUSH, dummy_int_arg, True)
-        assert (rc == 0)
-
-        print('Verify ioctl read of buf_count == 0')
-        rc = fcntl.ioctl(fo, _IOCTL_GPIO_COUNT, buf_count, True)
-        assert (rc == 0)
-        print ('buf_count=', buf_count)
-        assert (buf_count.value == 0)
+    print ("Verify read-back data")
+    assert(read_gpio_buffer() == data)
+    assert_buf_count_multi(0)
