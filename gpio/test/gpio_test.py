@@ -20,10 +20,10 @@ modpath = os.path.realpath(os.path.dirname(__file__))+'/../%s.ko' % kmodule
 print ('modpath=',modpath)
 
 #define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t *)
-_IOCTL_GPIO_FLUSH = ioctl_opt.IOW(ord('g'), ord('f'), ctypes.c_int32)
+_IOCTL_GPIO_FLUSH = ioctl_opt.IOW(ord('g'), ord('f'), ctypes.c_void_p)
 
 #define IOCTL_GPIO_COUNT _IOR('g','b',size_t *)
-_IOCTL_GPIO_COUNT = ioctl_opt.IOR(ord('g'), ord('b'), ctypes.c_size_t)
+_IOCTL_GPIO_COUNT = ioctl_opt.IOR(ord('g'), ord('b'), ctypes.c_void_p)
 
 
 def call_os_cmd(cmd_string):
@@ -91,6 +91,7 @@ def test_initial_conditions():
 # @pytest.mark.skip("WIP")
 def test_mode_0():
     buf_count = ctypes.c_size_t()
+    dummy_int_arg = ctypes.c_int32()
 
     # device file operations
     print('Verify opening %s' % dev)
@@ -131,3 +132,16 @@ def test_mode_0():
     result = call_os_cmd('cat %s' % sysfs_buf_count)
     assert(result=='%s'%l)
 
+    fd = os.open(dev, os.O_RDWR)
+    assert (fd is not None)
+    with os.fdopen(fd, 'w') as fo:
+        assert(fo is not None)
+        print('Flush buffer using IOCTL_GPIO_FLUSH')
+        rc = fcntl.ioctl(fo, _IOCTL_GPIO_FLUSH, dummy_int_arg, True)
+        assert (rc == 0)
+
+        print('Verify ioctl read of buf_count == 0')
+        rc = fcntl.ioctl(fo, _IOCTL_GPIO_COUNT, buf_count, True)
+        assert (rc == 0)
+        print ('buf_count=', buf_count)
+        assert (buf_count.value == 0)
