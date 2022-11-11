@@ -31,8 +31,8 @@
 #define PROC_BUF_COUNT_NAME "buf_count"
 #define PROC_GPIO_MODE_NAME "gpio_mode"
 
-#define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t*)
-#define IOCTL_GPIO_COUNT _IOR('g','b',size_t*)
+#define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t *)
+#define IOCTL_GPIO_COUNT _IOR('g','b',size_t *)
 
 dev_t dev = 0;
 static struct class *dev_class = NULL;
@@ -565,12 +565,13 @@ static long gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
          switch(cmd) {
                 case IOCTL_GPIO_FLUSH:
                         mutex_lock(&buf_mutex);
-                        KLOG_INFO("flushing buffer of %ld bytes...\n", buf_count);
+                        KLOG_INFO("IOCTL_GPIO_FLUSH flushing buffer of %ld bytes...\n", buf_count);
                         buffer_flush();
                         mutex_unlock(&buf_mutex);
                         break;
 
                 case IOCTL_GPIO_COUNT:
+                        KLOG_INFO("IOCTL_GPIO_COUNT read %ld", buf_count);
                         if( copy_to_user((size_t*) arg, &buf_count, sizeof(buf_count)) )
                         {
                                 KLOG_ERR("ERROR copying to user\n");
@@ -578,7 +579,7 @@ static long gpio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                         break;
                 default:
                         KLOG_INFO("Unknown ioctl call %d, IGNORED\n", cmd);
-                        break;
+                        return EINVAL;
         }
         return 0;
 }

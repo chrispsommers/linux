@@ -9,7 +9,8 @@ print ('modpath=',modpath)
 
 
 # https://stackoverflow.com/questions/40660842/pytest-setup-teardown-hooks-for-session
-@pytest.fixture(autouse=True, scope='session')
+# @pytest.fixture(autouse=True, scope='session')
+@pytest.fixture(autouse=True)
 def kmod_fixture():
     print ("Inserting kernel module %s..." % kmodule)
     subprocess.run(['insmod', '%s' % modpath])

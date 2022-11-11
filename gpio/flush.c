@@ -7,8 +7,8 @@
 #include <unistd.h>
 #include<sys/ioctl.h>
  
-#define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t*)
-#define IOCTL_GPIO_COUNT _IOR('g','b',size_t*)
+#define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t *)
+#define IOCTL_GPIO_COUNT _IOR('g','b',size_t *)
 #define DEV_NAME "fake_gpio"
 
 int main()
