@@ -20,11 +20,11 @@ procfs_gpio_mode = '%s/gpio_mode' % procfs
 modpath = os.path.realpath(os.path.dirname(__file__))+'/../%s.ko' % kmodule
 print ('modpath=',modpath)
 
-#define IOCTL_GPIO_FLUSH _IOW('g','f',int32_t *)
-_IOCTL_GPIO_FLUSH = ioctl_opt.IOW(ord('g'), ord('f'), ctypes.c_void_p)
+#define IOCTL_GPIO_BYTES_FLUSH _IOW('g','F',int32_t *)
+_IOCTL_GPIO_BYTES_FLUSH = ioctl_opt.IOW(ord('g'), ord('F'), ctypes.c_void_p)
 
-#define IOCTL_GPIO_COUNT _IOR('g','b',size_t *)
-_IOCTL_GPIO_COUNT = ioctl_opt.IOR(ord('g'), ord('b'), ctypes.c_void_p)
+#define IOCTL_GPIO_BYTES_COUNT _IOR('g','B',size_t *)
+_IOCTL_GPIO_BYTES_COUNT = ioctl_opt.IOR(ord('g'), ord('B'), ctypes.c_void_p)
 
 # =================== HELPERS ======================
 def call_os_cmd(cmd):
@@ -58,13 +58,13 @@ def read_ioctl_buf_count(fo = None):
     '''
     buf_count = ctypes.c_size_t()
     if fo:
-        return ioctl_cmd(fo, '_IOCTL_GPIO_COUNT', buf_count)
+        return ioctl_cmd(fo, '_IOCTL_GPIO_BYTES_COUNT', buf_count)
     else:
         fd = os.open(dev, os.O_WRONLY)
         assert (fd is not None)
         with os.fdopen(fd, 'w') as fo:
             assert(fo is not None)
-            return ioctl_cmd(fo, '_IOCTL_GPIO_COUNT', buf_count)
+            return ioctl_cmd(fo, '_IOCTL_GPIO_BYTES_COUNT', buf_count)
 
 def write_ioctl_gpio_flush(fo = None):
     '''
@@ -73,13 +73,13 @@ def write_ioctl_gpio_flush(fo = None):
     '''
     dummy_int_arg = ctypes.c_int32()
     if fo:
-        return ioctl_cmd(fo, '_IOCTL_GPIO_FLUSH', dummy_int_arg)
+        return ioctl_cmd(fo, '_IOCTL_GPIO_BYTES_FLUSH', dummy_int_arg)
     else:
         fd = os.open(dev, os.O_WRONLY)
         assert (fd is not None)
         with os.fdopen(fd, 'w') as fo:
             assert(fo is not None)
-            return ioctl_cmd(fo, '_IOCTL_GPIO_FLUSH', dummy_int_arg)
+            return ioctl_cmd(fo, '_IOCTL_GPIO_BYTES_FLUSH', dummy_int_arg)
 
 def write_gpio_buffer(data):
     fd = os.open(dev, os.O_WRONLY)
@@ -153,7 +153,7 @@ def test_initial_conditions():
 
 def test_mode_0():
     # Ensure clean starting condition
-    print('Flush buffer using IOCTL_GPIO_FLUSH')
+    print('Flush buffer using IOCTL_GPIO_BYTES_FLUSH')
     assert (write_ioctl_gpio_flush() == 0)
     assert (read_ioctl_buf_count() == 0)
 
@@ -163,9 +163,8 @@ def test_mode_0():
     assert(write_gpio_buffer(data) == data_len)
     assert_buf_count_multi(data_len)
 
-    print('Flush buffer using IOCTL_GPIO_FLUSH')
+    print('Flush buffer using IOCTL_GPIO_BYTES_FLUSH')
     assert (write_ioctl_gpio_flush() == 0)
-
     assert_buf_count_multi(0)
 
     # write data, read back
