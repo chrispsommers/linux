@@ -4,6 +4,9 @@
 #define IOCTL_GPIO_BYTES_FLUSH _IOW('g','F',int32_t *)
 #define IOCTL_GPIO_BYTES_COUNT _IOR('g','B',size_t *)
 
+#define IOCTL_GPIO_BITS_FLUSH _IOW('g','f',int32_t *)
+#define IOCTL_GPIO_BITS_COUNT _IOR('g','b',size_t *)
+
 #define BYTE_BUF_SZ        10
 #define BYTE_DEV_CLASS "fake_gpio_byte_class"
 #define BYTE_BUF_DEV_NAME "fake_gpio"
@@ -17,6 +20,12 @@
 #define BIT_BUF_SZ        (12*BYTE_BUF_SZ) // byte + preamable
 #define BIT_DEV_CLASS "fake_gpio_bit_class"
 #define BIT_BUF_DEV_NAME "fake_gpio_bits"
+
+
+#define WAIT_DLY_MIN_USEC 100000      // .100 sec
+#define WAIT_DLY_MAX_USEC 101000      // .101 sec
+#define BIT_DURATION_MIN_USEC 100000  // .100 sec
+#define BIT_DURATION_MAX_USEC 101000  // .101 sec
 
 typedef enum gpio_mode_e {
         MODE_FIFO_ONLY = 0,                             // can read and write buffer, no serialzation

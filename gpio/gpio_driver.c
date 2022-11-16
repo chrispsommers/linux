@@ -32,12 +32,19 @@ static struct cdev fake_gpio_bit_cdev;
 circ_buf_t bit_buf;
 
 struct kobject *gpio_kobj = NULL;
-static struct task_struct *drain_poll_loop_thread = NULL;
-bool drain_poll_loop_thread_running = false;
-static struct task_struct *drain_wait_loop_thread = NULL;
-bool drain_wait_loop_thread_running = false;
-DECLARE_WAIT_QUEUE_HEAD(gpio_buffer_wq);
+static struct task_struct *byte_drain_poll_loop_thread = NULL;
+bool byte_drain_poll_loop_thread_running = false;
+
+static struct task_struct *byte_drain_wait_loop_thread = NULL;
+bool byte_drain_wait_loop_thread_running = false;
+
+static struct task_struct *bit_drain_wait_loop_thread = NULL;
+bool bit_drain_wait_loop_thread_running = false;
+
+DECLARE_WAIT_QUEUE_HEAD(gpio_byte_buffer_wq);
+DECLARE_WAIT_QUEUE_HEAD(gpio_bit_buffer_wq);
 DEFINE_MUTEX(byte_buf_mutex);
+DEFINE_MUTEX(bit_buf_mutex);
 static struct proc_dir_entry *gpio_proc_root;
 bool proc_read_buf_count_done = false;
 bool proc_read_gpio_mode_done = false;
@@ -58,7 +65,7 @@ static ssize_t  buf_count_set(struct kobject *kobj,
                         
 struct kobj_attribute gpio_mode_attr = __ATTR(SYSFS_GPIO_MODE_NAME, 0660, gpio_mode_get, gpio_mode_set);
 struct kobj_attribute buf_count_attr = __ATTR(SYSFS_BUF_COUNT_NAME, 0660, buf_count_get, buf_count_set);
-void drain_buffer_blocking(void);
+void byte_drain_buffer_blocking(void);
 
 // File ops callbacks & structure
 static int      fake_gpio_byte_open(struct inode *inode, struct file *file);
@@ -80,12 +87,14 @@ static struct file_operations byte_fops =
 static int      fake_gpio_bit_open(struct inode *inode, struct file *file);
 static int      fake_gpio_bit_release(struct inode *inode, struct file *file);
 static ssize_t  fake_gpio_bit_read(struct file *fp, char __user *buf, size_t len,loff_t * off);
+static ssize_t  fake_gpio_bit_write(struct file *fp, const char *buf, size_t len, loff_t * off);
 static long     fake_gpio_bit_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 static struct file_operations bit_fops =
 {
         .owner          = THIS_MODULE,
         .read           = fake_gpio_bit_read,
+        .write          = fake_gpio_bit_write,
         .open           = fake_gpio_bit_open,
         .unlocked_ioctl = fake_gpio_bit_ioctl,
         .release        = fake_gpio_bit_release
@@ -99,7 +108,6 @@ static ssize_t  fake_gpio_buf_count_read_proc(struct file *fp, char __user *buff
 static struct proc_ops proc_buf_count_fops = {
         .proc_open = fake_gpio_buf_count_open_proc,
         .proc_read = fake_gpio_buf_count_read_proc,
-        // .proc_write = fake_gpio_buf_count_write_proc,
         .proc_write = NULL, // no writes
         .proc_release = fake_gpio_buf_count_release_proc
 }; 
@@ -117,6 +125,10 @@ static struct proc_ops proc_gpio_mode_fops = {
         .proc_release = fake_gpio_gpio_mode_release_proc
 }; 
 
+//=========================================================================================
+//                             BYTE device
+//=========================================================================================
+
 // Open byte device file
 static int fake_gpio_byte_open(struct inode *inode, struct file *file)
 {
@@ -130,9 +142,8 @@ static int fake_gpio_byte_release(struct inode *inode, struct file *file)
         KLOG_INFO("device file /dev/%s closed\n", BYTE_BUF_DEV_NAME);
         return 0;
 }
-/*
- * Read from device file
- */
+
+// Read from byte device file
 static ssize_t fake_gpio_byte_read(struct file *fp, char __user *ubuf, size_t len, loff_t *off)
 {
         int rc = 0;
@@ -153,16 +164,13 @@ static ssize_t fake_gpio_byte_read(struct file *fp, char __user *ubuf, size_t le
         rlen = (len < KCIRC_BUF_COUNT(&byte_buf))?len:KCIRC_BUF_COUNT(&byte_buf);
         KLOG_INFO("request to read %ld bytes, will actually try to read %ld bytes\n", len, rlen);
         // finally pop data from internal FIFO buffer
-        // actual_rlen = byte_buffer_pop(ubuf, rlen);
         actual_rlen = kcirc_bufpop(&byte_buf, ubuf, rlen);
         KLOG_INFO("popped %ld bytes\n", actual_rlen);
         mutex_unlock(&byte_buf_mutex);
         return actual_rlen;
 }
 
-/*
- * Write to device file
- */
+// Write to byte device file
 static ssize_t fake_gpio_byte_write(struct file *fp, const char __user *ubuf, size_t len, loff_t *off)
 {
         size_t wlen;
@@ -189,62 +197,80 @@ static ssize_t fake_gpio_byte_write(struct file *fp, const char __user *ubuf, si
                 KLOG_INFO("actually writing %ld bytes\n", wlen);
         }
         // finally push data into internal FIFO buffer
-        // actual_wlen = byte_buffer_push(ubuf, wlen);
         actual_wlen = kcirc_bufpush(&byte_buf, ubuf, wlen);
         mutex_unlock(&byte_buf_mutex);
         if (actual_wlen > 0) {
-                wake_up_interruptible(&gpio_buffer_wq);
+                wake_up_interruptible(&gpio_byte_buffer_wq);
         }
         KLOG_INFO("pushed %ld bytes\n", actual_wlen);
         if (gpio_mode == MODE_SERIALIZE_BLOCKING) {
                 KLOG_INFO("draining buffer (blocking)...\n");
-                drain_buffer_blocking();
+                byte_drain_buffer_blocking();
         }
         return actual_wlen;
 }
 
-#define WAIT_DLY_MIN_USEC 100000      // .100 sec
-#define WAIT_DLY_MAX_USEC 101000      // .101 sec
-#define BIT_DURATION_MIN_USEC 100000  // .100 sec
-#define BIT_DURATION_MAX_USEC 101000  // .101 sec
+// byte device ioctl
+static long fake_gpio_byte_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+        KLOG_INFO("received cmd=%d arg=%ld\n", cmd, arg);
+
+         switch(cmd) {
+                case IOCTL_GPIO_BYTES_FLUSH:
+                        mutex_lock(&byte_buf_mutex);
+                        KLOG_INFO("IOCTL_GPIO_BYTES_FLUSH flushing buffer of %ld bytes...\n", KCIRC_BUF_COUNT(&byte_buf));
+                        // byte_buffer_flush();
+                        kcirc_buf_flush(&byte_buf);
+                        mutex_unlock(&byte_buf_mutex);
+                        break;
+
+                case IOCTL_GPIO_BYTES_COUNT:
+                        KLOG_INFO("IOCTL_GPIO_BYTES_COUNT read %ld", KCIRC_BUF_COUNT(&byte_buf));
+                        if( copy_to_user((size_t*) arg, &(KCIRC_BUF_COUNT(&byte_buf)), sizeof(KCIRC_BUF_COUNT(&byte_buf))) )
+                        {
+                                KLOG_ERR("ERROR copying to user\n");
+                        }
+                        break;
+                default:
+                        KLOG_INFO("Unknown ioctl call %d, IGNORED\n", cmd);
+                        return EINVAL;
+        }
+        return 0;
+}
 
 char preamble[2] = {0,1}; // bits represented as bytes for simplicity to change
 char postamble[2] = {0,1};
 
-void clear_output(void) {
-        KLOG_INFO("clear_output() sent 0\n");
-}
-
-void set_output(void) {
-        KLOG_INFO("set_output()   sent 1\n");
-}
-
-void send_bit(bool bit) {
-        if (bit) {
-                set_output();
-        } else {
-                clear_output();
-        }
+void output_bit(char bit) {
+        KLOG_INFO("set_output() %c\n", bit);
         usleep_range(BIT_DURATION_MIN_USEC,BIT_DURATION_MAX_USEC);
+}
+
+void queue_bit(bool bit) {
+        mutex_lock(&bit_buf_mutex);
+        kcirc_bufpush_one(&bit_buf, bit?'1':'0');
+        mutex_unlock(&bit_buf_mutex);
+        // KLOG_INFO("Waking up gpio_bit_buffer_wq\n");
+        wake_up_interruptible(&gpio_bit_buffer_wq);
 }
 
 void send_x_amble(char *data, ssize_t len) {
         int i;
         KLOG_INFO("sending framing %ld bits\n", len);
         for (i = 0; i< len; i++) {
-                send_bit(data[i]);
+                queue_bit(data[i]);
         }
 }
 
 // shift bits out LSB first, surrounded by framing
 void serialize_byte(char data) {
         int i;
-        KLOG_INFO("serialize_byte 0x%02x\n", data);
+        KLOG_INFO("serialize_byte 0x%02x = '%c'\n", data, data);
 
         send_x_amble(preamble, sizeof(preamble)/sizeof(preamble[0]));
         KLOG_INFO("sending data 8 bits\n");
         for (i = 0; i < 8; i++) {
-                send_bit(data & 1<<i);
+                queue_bit(data & 1<<i);
         }
         send_x_amble(postamble, sizeof(postamble)/sizeof(postamble[0]));
 }
@@ -263,9 +289,21 @@ int send_one_byte_conditionally(void) {
         return rc;
 }
 
-// Drain the buffer & serialize it to FAKE I2C bus - blocking
+// send a bit out if available; mutex-protected
+int send_one_bit_conditionally(void) {
+        char data;
+        int rc = 0;
+        mutex_lock(&bit_buf_mutex);
+        rc = kcirc_bufpop_one(&bit_buf, &data);
+        mutex_unlock(&bit_buf_mutex);
+        if (rc) {
+                output_bit(data);
+        }
+        return rc;
+}
+// Drain the byte buffer & serialize it to FAKE I2C bus - blocking
 // https://www.kernel.org/doc/html/latest/timers/timers-howto.html
-void drain_buffer_blocking(void) {
+void byte_drain_buffer_blocking(void) {
         // char data;
         int rc = 1;
         while (rc) {
@@ -274,43 +312,42 @@ void drain_buffer_blocking(void) {
 }
 
 /*
- * Continuously poll buffer in a thread
+ * Continuously poll byte buffer in a thread
  * Drain a byte at a time if gpio_mode == MODE_SERIALIZE_NONBLOCKING_POLLED
  */
-int drain_buffer_poll_thread_fn(void *context) {
+int byte_drain_buffer_poll_thread_fn(void *context) {
         // char data;
         int rc = 0;
         KLOG_INFO("entered thread\n");
         allow_signal(SIGKILL);
-        drain_poll_loop_thread_running = true;
+        byte_drain_poll_loop_thread_running = true;
         while(!kthread_should_stop()) {
                 if (gpio_mode == MODE_SERIALIZE_NONBLOCKING_POLLED) {
                         rc = send_one_byte_conditionally();
                 }
-                if (signal_pending(drain_poll_loop_thread)) // catch sigkill
+                if (signal_pending(byte_drain_poll_loop_thread)) // catch sigkill
                         break;
 
                 usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
         }
-        drain_poll_loop_thread_running = false;
+        byte_drain_poll_loop_thread_running = false;
         KLOG_INFO("leaving thread\n");
         return 0;
 }
+
 /*
- * Thread, wait on gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ and drain
-  * buffer, otherwise go back to waiting
+ * Byte buffer drain thread, wait on mode change, buffer change, signal
  */
-int drain_buffer_wait_thread_fn(void *context) {
-        // char data;
+int byte_drain_buffer_wait_thread_fn(void *context) {
         gpio_mode_t old_mode = 0;
         int rc = 0;
         KLOG_INFO("entered thread\n");
         allow_signal(SIGKILL);
-        drain_wait_loop_thread_running = true;
+        byte_drain_wait_loop_thread_running = true;
         while(!kthread_should_stop()) {
                 KLOG_INFO("Waiting ...\n");
                 // Wake up on sigkill, or wait mode && (data to send or mode changed)
-                wait_event_interruptible(gpio_buffer_wq,
+                wait_event_interruptible(gpio_byte_buffer_wq,
                                                 (kthread_should_stop() ||
                                                 ( (gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) &&
                                                   ( (KCIRC_BUF_COUNT(&byte_buf) > 0) || (gpio_mode != old_mode))
@@ -321,12 +358,38 @@ int drain_buffer_wait_thread_fn(void *context) {
                 if(gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) {
                         rc = send_one_byte_conditionally();
                 }
-                if (signal_pending(drain_wait_loop_thread)) // catch sigkill
+                if (signal_pending(byte_drain_wait_loop_thread)) // catch sigkill
                         break;
 
                 usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
         }
-        drain_wait_loop_thread_running = false;
+        byte_drain_wait_loop_thread_running = false;
+        KLOG_INFO("leaving thread\n");
+        return 0;
+}
+
+/*
+ * Bit buffer thread, wait on buffer change, signal
+ */
+int bit_drain_buffer_wait_thread_fn(void *context) {
+        int rc = 0;
+        KLOG_INFO("entered thread\n");
+        allow_signal(SIGKILL);
+        bit_drain_wait_loop_thread_running = true;
+        while(!kthread_should_stop()) {
+                KLOG_INFO("Waiting ...\n");
+                // Wake up on sigkill, or  data to send
+                wait_event_interruptible(gpio_bit_buffer_wq,
+                                                (kthread_should_stop() || (KCIRC_BUF_COUNT(&bit_buf) > 0) )
+                                        );
+                KLOG_INFO("woke up!\n");
+                rc = send_one_bit_conditionally();
+                if (signal_pending(bit_drain_wait_loop_thread)) // catch sigkill
+                        break;
+
+                usleep_range(WAIT_DLY_MIN_USEC,WAIT_DLY_MAX_USEC);
+        }
+        bit_drain_wait_loop_thread_running = false;
         KLOG_INFO("leaving thread\n");
         return 0;
 }
@@ -362,8 +425,8 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
         }
         gpio_mode = gpio_mode_tmp;
         KLOG_INFO(" => '%d'\n", gpio_mode);
-        if ((gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) && drain_wait_loop_thread) {
-                wake_up_interruptible(&gpio_buffer_wq);
+        if ((gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) && byte_drain_wait_loop_thread) {
+                wake_up_interruptible(&gpio_byte_buffer_wq);
         }
         return count;
 }
@@ -486,25 +549,107 @@ static ssize_t fake_gpio_gpio_mode_write_proc(struct file *fp, const char *buff,
         return len;
 }
 
-//================================================
-//=========== ioctl
-//================================================
-static long fake_gpio_byte_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+
+//=========================================================================================
+//                             BIT SERIAL device
+//=========================================================================================
+
+// Open bit device file
+static int fake_gpio_bit_open(struct inode *inode, struct file *file)
+{
+        KLOG_INFO("device file /dev/%s opened\n", BIT_BUF_DEV_NAME);
+        return 0;
+}
+
+// Close bit device file
+static int fake_gpio_bit_release(struct inode *inode, struct file *file)
+{
+        KLOG_INFO("device file /dev/%s closed\n", BIT_BUF_DEV_NAME);
+        return 0;
+}
+
+
+// Read from bit device file
+static ssize_t fake_gpio_bit_read(struct file *fp, char __user *ubuf, size_t len, loff_t *off)
+{
+        int rc = 0;
+        size_t rlen = 0;
+        size_t actual_rlen=0;
+        rc = mutex_lock_interruptible(&bit_buf_mutex);
+        if (rc) {
+            KLOG_ERR("mutex interrupted, err = %d\n", rc);
+            return rc;
+        }
+
+        if (KCIRC_BUF_COUNT(&bit_buf) == 0) {
+                KLOG_INFO("buffer empty, nothing to read\n");
+                mutex_unlock(&bit_buf_mutex);
+                return 0;
+        }
+
+        rlen = (len < KCIRC_BUF_COUNT(&bit_buf))?len:KCIRC_BUF_COUNT(&bit_buf);
+        KLOG_INFO("request to read %ld chars, will actually try to read %ld chars\n", len, rlen);
+        // finally pop data from internal FIFO buffer
+        actual_rlen = kcirc_bufpop(&bit_buf, ubuf, rlen);
+        KLOG_INFO("popped %ld bits\n", actual_rlen);
+        mutex_unlock(&bit_buf_mutex);
+        return actual_rlen;
+}
+
+// Write to bit device file
+static ssize_t fake_gpio_bit_write(struct file *fp, const char __user *ubuf, size_t len, loff_t *off)
+{
+        size_t wlen;
+        size_t actual_wlen = 0;
+        int rc = 0;
+
+        KLOG_INFO("request to write %ld chars\n", len);
+        rc = mutex_lock_interruptible(&bit_buf_mutex);
+        if (rc) {
+            KLOG_ERR("mutex interrupted, err = %d\n", rc);
+            return rc;
+        }
+        if (KCIRC_BUF_COUNT(&bit_buf) == BIT_BUF_SZ) {
+                KLOG_INFO("buffer full, nothing to write\n");
+                mutex_unlock(&bit_buf_mutex);
+                return ENOSPC;
+        }        
+        if (len > BIT_BUF_SZ) {
+                wlen = BIT_BUF_SZ;
+                KLOG_INFO("truncating write to %ld chars\n", wlen);
+
+        } else {
+                wlen = len;
+                KLOG_INFO("actually writing %ld chars\n", wlen);
+        }
+        // finally push data into internal FIFO buffer
+        actual_wlen = kcirc_bufpush(&bit_buf, ubuf, wlen);
+        mutex_unlock(&bit_buf_mutex);
+        if (actual_wlen > 0) {
+                // KLOG_INFO("Waking up gpio_bit_buffer_wq\n");
+                wake_up_interruptible(&gpio_bit_buffer_wq);
+        }
+        KLOG_INFO("pushed %ld chars\n", actual_wlen);
+        return actual_wlen;
+}
+
+// bit device ioctl
+static long fake_gpio_bit_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
         KLOG_INFO("received cmd=%d arg=%ld\n", cmd, arg);
 
          switch(cmd) {
-                case IOCTL_GPIO_BYTES_FLUSH:
-                        mutex_lock(&byte_buf_mutex);
-                        KLOG_INFO("IOCTL_GPIO_BYTES_FLUSH flushing buffer of %ld bytes...\n", KCIRC_BUF_COUNT(&byte_buf));
-                        // byte_buffer_flush();
-                        kcirc_buf_flush(&byte_buf);
-                        mutex_unlock(&byte_buf_mutex);
+                case IOCTL_GPIO_BITS_FLUSH:
+                        mutex_lock(&bit_buf_mutex);
+                        KLOG_INFO("IOCTL_GPIO_BITS_FLUSH flushing buffer of %ld bits...\n", KCIRC_BUF_COUNT(&bit_buf));
+                        // bit_buffer_flush();
+                        kcirc_buf_flush(&bit_buf);
+                        mutex_unlock(&bit_buf_mutex);
                         break;
 
-                case IOCTL_GPIO_BYTES_COUNT:
-                        KLOG_INFO("IOCTL_GPIO_BYTES_COUNT read %ld", KCIRC_BUF_COUNT(&byte_buf));
-                        if( copy_to_user((size_t*) arg, &(KCIRC_BUF_COUNT(&byte_buf)), sizeof(KCIRC_BUF_COUNT(&byte_buf))) )
+                case IOCTL_GPIO_BITS_COUNT:
+                        KLOG_INFO("IOCTL_GPIO_BITS_COUNT read %ld", KCIRC_BUF_COUNT(&bit_buf));
+                        if( copy_to_user((size_t*) arg, &(KCIRC_BUF_COUNT(&bit_buf)), sizeof(KCIRC_BUF_COUNT(&bit_buf))) )
                         {
                                 KLOG_ERR("ERROR copying to user\n");
                         }
@@ -516,34 +661,13 @@ static long fake_gpio_byte_ioctl(struct file *file, unsigned int cmd, unsigned l
         return 0;
 }
 
-// "bit" device
 
 
 
-// Open byte device file
-static int fake_gpio_bit_open(struct inode *inode, struct file *file)
-{
-        KLOG_INFO("device file /dev/%s opened\n", BIT_BUF_DEV_NAME);
-        return 0;
-}
+//=========================================================================================
+//                             MODULE INSERT/REMOVE
+//=========================================================================================
 
-// Close byte device file
-static int fake_gpio_bit_release(struct inode *inode, struct file *file)
-{
-        KLOG_INFO("device file /dev/%s closed\n", BIT_BUF_DEV_NAME);
-        return 0;
-}
-
-static ssize_t  fake_gpio_bit_read(struct file *fp, char __user *buf, size_t len,loff_t * off) {
-        return 0;
-}
-static long     fake_gpio_bit_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-        return 0;
-}
-
-/*
- * Module insert
- */
 static int __init fake_gpio_driver_init(void)
 {
         //============ byte-buffer device ===============
@@ -578,7 +702,7 @@ static int __init fake_gpio_driver_init(void)
         }
         KLOG_INFO("Created device %s\n", BYTE_BUF_DEV_NAME);
        
-        KCIRC_BUF_ALLOC_AND_INIT(&byte_buf, BYTE_BUF_SZ);
+        KCIRC_BUF_ALLOC_AND_INIT(&byte_buf, BYTE_BUF_SZ, "byte_buf");
         // Create sysfs directory in /sys/kernel/
         gpio_kobj = kobject_create_and_add(SYSFS_DIR,kernel_kobj);
  
@@ -653,20 +777,28 @@ static int __init fake_gpio_driver_init(void)
         KLOG_INFO("Created device %s\n", BYTE_BUF_DEV_NAME);
         
         // Alloc buffer for gpio
-        KCIRC_BUF_ALLOC_AND_INIT(&bit_buf, BIT_BUF_SZ);
+        KCIRC_BUF_ALLOC_AND_INIT(&bit_buf, BIT_BUF_SZ, "bit_buf");
 
         //================= START THREADS ======================
-        // start buffer drain polling thread; only drains if mode is set appropriately
-        KLOG_INFO("Creating drain_poll_loop_thread...\n");
-        drain_poll_loop_thread = kthread_create(drain_buffer_poll_thread_fn,NULL,"drain_buffer_poll_thread_fn");
-        KLOG_INFO("waking up drain_poll_loop_thread...\n");
-        wake_up_process(drain_poll_loop_thread);
+        // start byte buffer drain polling thread; only drains if mode is set appropriately
+        KLOG_INFO("Creating byte_drain_poll_loop_thread...\n");
+        byte_drain_poll_loop_thread = kthread_create(byte_drain_buffer_poll_thread_fn,NULL,"byte_drain_buffer_poll_thread_fn");
+        KLOG_INFO("waking up byte_drain_poll_loop_thread...\n");
+        wake_up_process(byte_drain_poll_loop_thread);
 
-        // start buffer drain wait queue thread; only drains if mode is set appropriately
-        KLOG_INFO("Creating drain_wait_loop_thread...\n");
-        drain_wait_loop_thread = kthread_create(drain_buffer_wait_thread_fn,NULL,"drain_buffer_wait_thread_fn");
-        KLOG_INFO("waking up drain_wait_loop_thread...\n");
-        wake_up_process(drain_wait_loop_thread);
+        // start byte buffer drain wait queue thread
+        KLOG_INFO("Creating byte_drain_wait_loop_thread...\n");
+        byte_drain_wait_loop_thread = kthread_create(byte_drain_buffer_wait_thread_fn,NULL,"byte_drain_buffer_wait_thread_fn");
+        KLOG_INFO("waking up byte_drain_wait_loop_thread...\n");
+        wake_up_process(byte_drain_wait_loop_thread);
+
+        // start bit buffer drain wait queue thread
+        KLOG_INFO("Creating bit_drain_wait_loop_thread...\n");
+        bit_drain_wait_loop_thread = kthread_create(bit_drain_buffer_wait_thread_fn,NULL,"bit_drain_buffer_wait_thread_fn");
+        KLOG_INFO("waking up bit_drain_wait_loop_thread...\n");
+        wake_up_process(bit_drain_wait_loop_thread);
+
+
         KLOG_INFO("Finished installing module!\n");
         return 0;
 
@@ -705,13 +837,13 @@ destroy_chrdev_region1:
  */
 static void __exit fake_gpio_driver_exit(void)
 {
-        if ( drain_poll_loop_thread) {
-                KLOG_INFO("stopping drain_poll_loop_thread...\n");
-                kthread_stop(drain_poll_loop_thread);
+        if ( byte_drain_poll_loop_thread) {
+                KLOG_INFO("stopping byte_drain_poll_loop_thread...\n");
+                kthread_stop(byte_drain_poll_loop_thread);
         }
-        if ( drain_wait_loop_thread) {
-                KLOG_INFO("stopping drain_wait_loop_thread...\n");
-                kthread_stop(drain_wait_loop_thread);
+        if ( byte_drain_wait_loop_thread) {
+                KLOG_INFO("stopping byte_drain_wait_loop_thread...\n");
+                kthread_stop(byte_drain_wait_loop_thread);
         }
         
         KLOG_INFO("Removing /sys/kernel/%s ... \n", SYSFS_DIR);

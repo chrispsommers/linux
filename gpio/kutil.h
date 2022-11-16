@@ -17,6 +17,7 @@ typedef struct s_circ_buf {
         char *end;
         size_t count;
         size_t size;
+        const char *name;
 } circ_buf_t;
 
 // Initialize and allocate a circular byte buffer
@@ -28,9 +29,10 @@ typedef struct s_circ_buf {
         (_bufptr)->count = 0;
 
 // Initialize and allocate a circular byte buffer
-#define KCIRC_BUF_ALLOC_AND_INIT(_bufptr,_size) \
+#define KCIRC_BUF_ALLOC_AND_INIT(_bufptr,_size, _name) \
         (_bufptr)->data = kmalloc(_size, GFP_KERNEL); \
         (_bufptr)->size = _size; \
+        (_bufptr)->name = _name; \
         KCIRC_BUF_RESET((_bufptr))
         
 

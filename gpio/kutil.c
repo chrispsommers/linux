@@ -12,9 +12,9 @@ int kcirc_bufpush_one(circ_buf_t *buf, char data) {
                 if (buf->head > buf->end) {
                         buf->head = buf->start; // wraparound
                 }
-                KLOG_INFO("data = '%c', buf->count=%ld, buf->head=%p\n", data, buf->count, buf->head);
+                KLOG_INFO("%s: data = '%c', buf->count=%ld\n", buf->name, data, buf->count);
         } else {
-                KLOG_INFO("buffer full (%ld), cannot push\n", buf->count);
+                KLOG_INFO("%s: buffer full (%ld), cannot push\n", buf->name, buf->count);
                 return 0;
         }
         // wake_up_interruptible(&gpio_buffer_wq);
@@ -33,11 +33,11 @@ size_t kcirc_bufpush(circ_buf_t *buf, const char __user *ubuf, size_t len) {
                 // copy userspace to kernel space one byte at a time & push to FIFO
                 rc = copy_from_user(&data, rp++, 1);
                 if(rc) {
-                        KLOG_ERR("copy_from_user(): ERROR %d!\n", rc);
+                        KLOG_ERR("%s: copy_from_user(): ERROR %d!\n", buf->name, rc);
                         break;
                 }
                 if (kcirc_bufpush_one(buf, data) == 0) {
-                        KLOG_INFO("buffer full upon writing %ld bytes\n", i);
+                        KLOG_INFO("%s: buffer full upon writing %ld bytes\n", buf->name, i);
                         break;
                 }
         }
@@ -58,7 +58,7 @@ int kcirc_bufpop_one(circ_buf_t *buf, char  *data) {
         if (buf->tail > buf->end) {
                 buf->tail = buf->start; // wraparound
         }
-        KLOG_INFO("data='%c',  buf->count=%ld, buf->tail=%p\n", *data, buf->count, buf->tail);
+        KLOG_INFO("%s: data='%c',  buf->count=%ld\n", buf->name, *data, buf->count);
         return 1;
 }
 
@@ -70,15 +70,15 @@ size_t kcirc_bufpop(circ_buf_t *buf, char __user *ubuf, size_t len) {
         size_t i;
         char data;
         wp = ubuf;
-        KLOG_INFO("kcirc_bufpop(): buf->count= %ld\n", buf->count);
+        KLOG_INFO("%s: kcirc_bufpop(): buf->count= %ld\n", buf->name, buf->count);
         for (i = 0; i < len; i++) {
                 if (!kcirc_bufpop_one(buf, &data)) {
-                        KLOG_INFO("buffer empty upon reading %ld bytes\n", i);
+                        KLOG_INFO("%s: buffer empty upon reading %ld bytes\n", buf->name, i);
                         return i;
                 }
                 rc = copy_to_user(wp++, &data, 1);
                 if(rc) {
-                        KLOG_ERR("copy_to_user(): ERROR %d!\n", rc);
+                        KLOG_ERR("%s: copy_to_user(): ERROR %d!\n", buf->name, rc);
                         return i;
                 }
         }
@@ -87,5 +87,6 @@ size_t kcirc_bufpop(circ_buf_t *buf, char __user *ubuf, size_t len) {
 
 // flush buffer - no mutex protection, caller responsible
 void kcirc_buf_flush(circ_buf_t *buf) {
+        KLOG_INFO("%s: flushing buffer of %ld bytes\n", buf->name, buf->count);
         KCIRC_BUF_RESET(buf);
 }
