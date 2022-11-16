@@ -1,5 +1,6 @@
 
 obj-m += fake_gpio.o 
+fake_gpio-y := kutil.o gpio_driver.o 
 CFLAGS+=-std=gnu99
 
 all: driver utils
@@ -14,4 +15,4 @@ test:
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build  M=$(shell pwd) clean
-	rm rgpio flush
+	-rm rgpio flush

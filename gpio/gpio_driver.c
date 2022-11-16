@@ -17,35 +17,19 @@
 #include<linux/proc_fs.h>
 #include <linux/ioctl.h>
 
+#include "kutil.h"
 #include "gpio.h"
-
-#define KLOG_INFO(fmt,...) \
-        pr_info("%s: %s()-%d: " fmt, __FILE__, __FUNCTION__, __LINE__, ##__VA_ARGS__ )
-
-#define KLOG_ERR(fmt,...) \
-        pr_err("%s: %s()-%d: " fmt, __FILE__, __FUNCTION__, __LINE__, ##__VA_ARGS__ )
-
 
 dev_t byte_dev = 0;
 static struct class *byte_dev_class = NULL;
 static struct cdev fake_gpio_byte_cdev;
-char *byte_buf = NULL;
-char *byte_buf_head = NULL;
-char *byte_buf_tail = NULL;
-char *byte_buf_start = NULL;
-char *byte_buf_end = NULL;
-size_t byte_buf_count = 0;
+circ_buf_t byte_buf;
 
 // output "bits" buffer
 dev_t bit_dev = 0;
 static struct class *bit_dev_class = NULL;
 static struct cdev fake_gpio_bit_cdev;
-char *bit_buf = NULL;
-char *bit_buf_head = NULL;
-char *bit_buf_tail = NULL;
-char *bit_buf_start = NULL;
-char *bit_buf_end = NULL;
-size_t bit_buf_count = 0;
+circ_buf_t bit_buf;
 
 struct kobject *gpio_kobj = NULL;
 static struct task_struct *drain_poll_loop_thread = NULL;
@@ -53,16 +37,11 @@ bool drain_poll_loop_thread_running = false;
 static struct task_struct *drain_wait_loop_thread = NULL;
 bool drain_wait_loop_thread_running = false;
 DECLARE_WAIT_QUEUE_HEAD(gpio_buffer_wq);
-DEFINE_MUTEX(buf_mutex);
+DEFINE_MUTEX(byte_buf_mutex);
 static struct proc_dir_entry *gpio_proc_root;
 bool proc_read_buf_count_done = false;
 bool proc_read_gpio_mode_done = false;
-typedef enum gpio_mode_e {
-        MODE_FIFO_ONLY = 0,                             // can read and write buffer, no serialzation
-        MODE_SERIALIZE_BLOCKING =1,                     // writes cause draining & serialization; blocking
-        MODE_SERIALIZE_NONBLOCKING_POLLED = 2,          // writes cause draining & serialization; non-blocking via polling thread
-        MODE_SERIALIZE_NONBLOCKING_WAITQ = 3            // writes cause draining & serialization; non-blocking via wait queue
-} gpio_mode_t;
+
 
 volatile gpio_mode_t gpio_mode = MODE_FIFO_ONLY;
 
@@ -112,7 +91,7 @@ static struct file_operations bit_fops =
         .release        = fake_gpio_bit_release
 };
 
-// procfs byte_buf_count operation callbacks & structure
+// procfs KCIRC_BUF_COUNT(&byte_buf) operation callbacks & structure
 static int      fake_gpio_buf_count_open_proc(struct inode *inode, struct file *file);
 static int      fake_gpio_buf_count_release_proc(struct inode *inode, struct file *file);
 static ssize_t  fake_gpio_buf_count_read_proc(struct file *fp, char __user *buffer, size_t length,loff_t * offset);
@@ -151,144 +130,54 @@ static int fake_gpio_byte_release(struct inode *inode, struct file *file)
         KLOG_INFO("device file /dev/%s closed\n", BYTE_BUF_DEV_NAME);
         return 0;
 }
-
-// push one byte into buffer
-// return 1 if success, 0 if no room available
-// no synchronization, caller must ensure e.g. via mutex
-int byte_buffer_push_one(char data) {
-        if (byte_buf_count < BYTE_BUF_SZ) {
-                byte_buf_count++;
-                *byte_buf_head++ = data;
-                if (byte_buf_head > byte_buf_end) {
-                        byte_buf_head = byte_buf_start; // wraparound
-                }
-                KLOG_INFO("data = '%c', byte_buf_count=%ld, byte_buf_head=%p\n", data, byte_buf_count, byte_buf_head);
-        } else {
-                KLOG_INFO("buffer full (%ld), cannot push\n", byte_buf_count);
-                return 0;
-        }
-        wake_up_interruptible(&gpio_buffer_wq);
-        return 1;
-}
-
-// push bytes onto circular buffer, does not overwrite
-// no synchronization, caller must ensure e.g. via mutex
-size_t byte_buffer_push(const char __user *buf, size_t len) {
-        const char __user *rp;
-        int rc;
-        char data;
-        size_t i;
-        rp = buf;
-        for (i = 0; i < len; i++) {
-                // copy userspace to kernel space one byte at a time & push to FIFO
-                rc = copy_from_user(&data, rp++, 1);
-                if(rc) {
-                        KLOG_ERR("copy_from_user(): ERROR %d!\n", rc);
-                        break;
-                }
-                if (byte_buffer_push_one(data) == 0) {
-                        KLOG_INFO("buffer full upon writing %ld bytes\n", i);
-                        break;
-                }
-        }
-        return i;
-}
-
-// pop one byte off buffer
-// return 0 if empty, 1 if byte was available
-// no synchronization, caller must ensure e.g. via mutex
-int byte_buffer_pop_one(char  *data) {
-        if (byte_buf_count == 0) {
-                // KLOG_INFO("buffer empty\n");
-                return 0;
-        }
-        *data = *byte_buf_tail;
-        byte_buf_count--;
-        byte_buf_tail++;
-        if (byte_buf_tail > byte_buf_end) {
-                byte_buf_tail = byte_buf_start; // wraparound
-        }
-        KLOG_INFO("data='%c',  byte_buf_count=%ld, byte_buf_tail=%p\n", *data, byte_buf_count, byte_buf_tail);
-        return 1;
-}
-
-// pop bytes off of circular buffer; no underrun allowed
-// no synchronization, caller must ensure e.g. via mutex
-size_t byte_buffer_pop(char __user *buf, size_t len) {
-        char *wp;
-        int rc;
-        size_t i;
-        char data;
-        wp = buf;
-        KLOG_INFO("byte_buffer_pop(): byte_buf_count= %ld\n", byte_buf_count);
-        for (i = 0; i < len; i++) {
-                if (!byte_buffer_pop_one(&data)) {
-                        KLOG_INFO("buffer empty upon reading %ld bytes\n", i);
-                        return i;
-                }
-                rc = copy_to_user(wp++, &data, 1);
-                if(rc) {
-                        KLOG_ERR("copy_to_user(): ERROR %d!\n", rc);
-                        return i;
-                }
-        }
-        return i;
-}
-
-// flush buffer - no mutex protection, caller responsible
-// TODO - faster to reset pointers, count
-void byte_buffer_flush(void) {
-        char data;
-        while (byte_buffer_pop_one(&data));
-}
-
 /*
  * Read from device file
  */
-static ssize_t fake_gpio_byte_read(struct file *fp, char __user *buf, size_t len, loff_t *off)
+static ssize_t fake_gpio_byte_read(struct file *fp, char __user *ubuf, size_t len, loff_t *off)
 {
         int rc = 0;
         size_t rlen = 0;
         size_t actual_rlen=0;
-        rc = mutex_lock_interruptible(&buf_mutex);
+        rc = mutex_lock_interruptible(&byte_buf_mutex);
         if (rc) {
             KLOG_ERR("mutex interrupted, err = %d\n", rc);
             return rc;
         }
 
-        if (byte_buf_count == 0) {
+        if (KCIRC_BUF_COUNT(&byte_buf) == 0) {
                 KLOG_INFO("buffer empty, nothing to read\n");
-                mutex_unlock(&buf_mutex);
+                mutex_unlock(&byte_buf_mutex);
                 return 0;
         }
 
-        rlen = (len < byte_buf_count)?len:byte_buf_count;
+        rlen = (len < KCIRC_BUF_COUNT(&byte_buf))?len:KCIRC_BUF_COUNT(&byte_buf);
         KLOG_INFO("request to read %ld bytes, will actually try to read %ld bytes\n", len, rlen);
         // finally pop data from internal FIFO buffer
-        actual_rlen = byte_buffer_pop(buf, rlen);
+        // actual_rlen = byte_buffer_pop(ubuf, rlen);
+        actual_rlen = kcirc_bufpop(&byte_buf, ubuf, rlen);
         KLOG_INFO("popped %ld bytes\n", actual_rlen);
-        mutex_unlock(&buf_mutex);
+        mutex_unlock(&byte_buf_mutex);
         return actual_rlen;
 }
 
 /*
  * Write to device file
  */
-static ssize_t fake_gpio_byte_write(struct file *fp, const char __user *buf, size_t len, loff_t *off)
+static ssize_t fake_gpio_byte_write(struct file *fp, const char __user *ubuf, size_t len, loff_t *off)
 {
         size_t wlen;
         size_t actual_wlen = 0;
         int rc = 0;
 
         KLOG_INFO("request to write %ld bytes\n", len);
-        rc = mutex_lock_interruptible(&buf_mutex);
+        rc = mutex_lock_interruptible(&byte_buf_mutex);
         if (rc) {
             KLOG_ERR("mutex interrupted, err = %d\n", rc);
             return rc;
         }
-        if (byte_buf_count == BYTE_BUF_SZ) {
+        if (KCIRC_BUF_COUNT(&byte_buf) == BYTE_BUF_SZ) {
                 KLOG_INFO("buffer full, nothing to write\n");
-                mutex_unlock(&buf_mutex);
+                mutex_unlock(&byte_buf_mutex);
                 return ENOSPC;
         }        
         if (len > BYTE_BUF_SZ) {
@@ -300,8 +189,12 @@ static ssize_t fake_gpio_byte_write(struct file *fp, const char __user *buf, siz
                 KLOG_INFO("actually writing %ld bytes\n", wlen);
         }
         // finally push data into internal FIFO buffer
-        actual_wlen = byte_buffer_push(buf, wlen);
-        mutex_unlock(&buf_mutex);
+        // actual_wlen = byte_buffer_push(ubuf, wlen);
+        actual_wlen = kcirc_bufpush(&byte_buf, ubuf, wlen);
+        mutex_unlock(&byte_buf_mutex);
+        if (actual_wlen > 0) {
+                wake_up_interruptible(&gpio_buffer_wq);
+        }
         KLOG_INFO("pushed %ld bytes\n", actual_wlen);
         if (gpio_mode == MODE_SERIALIZE_BLOCKING) {
                 KLOG_INFO("draining buffer (blocking)...\n");
@@ -360,9 +253,10 @@ void serialize_byte(char data) {
 int send_one_byte_conditionally(void) {
         char data;
         int rc = 0;
-        mutex_lock(&buf_mutex);
-        rc = byte_buffer_pop_one(&data);
-        mutex_unlock(&buf_mutex);
+        mutex_lock(&byte_buf_mutex);
+        // rc = byte_buffer_pop_one(&data);
+        rc = kcirc_bufpop_one(&byte_buf, &data);
+        mutex_unlock(&byte_buf_mutex);
         if (rc) {
                 serialize_byte(data);
         }
@@ -419,7 +313,7 @@ int drain_buffer_wait_thread_fn(void *context) {
                 wait_event_interruptible(gpio_buffer_wq,
                                                 (kthread_should_stop() ||
                                                 ( (gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) &&
-                                                  ( (byte_buf_count > 0) || (gpio_mode != old_mode))
+                                                  ( (KCIRC_BUF_COUNT(&byte_buf) > 0) || (gpio_mode != old_mode))
                                                 )
                                         ) );
                 KLOG_INFO("woke up!\n");
@@ -456,7 +350,17 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
                 struct kobj_attribute *attr,const char *buf, size_t count)
 {
         ssize_t len;
-        len = sscanf(buf,"%d",(int *)(&gpio_mode));
+        gpio_mode_t gpio_mode_tmp;
+        len = sscanf(buf,"%d",(int *)(&gpio_mode_tmp));
+        if (len != 1) {
+                KLOG_ERR("Bad gpio_mode '%s', not an integer\n", buf);
+                return EINVAL;
+        }
+        if (!VALID_MODE(gpio_mode_tmp)) {
+                KLOG_ERR("Bad gpio_mode %d, out of range\n", gpio_mode_tmp);
+                return EINVAL;
+        }
+        gpio_mode = gpio_mode_tmp;
         KLOG_INFO(" => '%d'\n", gpio_mode);
         if ((gpio_mode == MODE_SERIALIZE_NONBLOCKING_WAITQ) && drain_wait_loop_thread) {
                 wake_up_interruptible(&gpio_buffer_wq);
@@ -465,18 +369,18 @@ static ssize_t gpio_mode_set(struct kobject *kobj,
 }
 
 /*
- * /sys/kernel/SYSFS_DIR/byte_buf_count read op
+ * /sys/kernel/SYSFS_DIR/KCIRC_BUF_COUNT(&byte_buf) read op
  */
 static ssize_t buf_count_get(struct kobject *kobj, 
                 struct kobj_attribute *attr, char *buf)
 {
         ssize_t len;
-        len = sprintf(buf, "%ld", byte_buf_count);
+        len = sprintf(buf, "%ld", KCIRC_BUF_COUNT(&byte_buf));
         // pr_info("buf_count_get() => '%s'\n", buf);
         return len;
 }
 
-// /sys/kernel/SYSFS_DIR/byte_buf_count write op
+// /sys/kernel/SYSFS_DIR/KCIRC_BUF_COUNT(&byte_buf) write op
 static ssize_t buf_count_set(struct kobject *kobj, 
                 struct kobj_attribute *attr,const char *buf, size_t count)
 {
@@ -485,7 +389,7 @@ static ssize_t buf_count_set(struct kobject *kobj,
 }
 
 //================================================
-//======== /proc/fake_gpio_procfs/byte_buf_count
+//======== /proc/fake_gpio_procfs/KCIRC_BUF_COUNT(&byte_buf)
 //================================================
 
 // Open procfs file
@@ -510,7 +414,8 @@ static ssize_t fake_gpio_buf_count_read_proc(struct file *fp, char __user *buffe
         ssize_t minlen;
         char local_buf[16];
         if (proc_read_buf_count_done) return 0;
-        len = sprintf(local_buf, "%ld", byte_buf_count);        
+        // len = sprintf(local_buf, "%ld", KCIRC_BUF_COUNT(&byte_buf));        
+        len = sprintf(local_buf, "%ld", byte_buf.count);        
         minlen = (length < len?length:len);
         if( copy_to_user(buffer,local_buf,minlen) ) {
             KLOG_ERR("copy_to_user_error\n");
@@ -550,7 +455,7 @@ static ssize_t fake_gpio_gpio_mode_read_proc(struct file *fp, char __user *buffe
         if( copy_to_user(buffer,local_buf,minlen) ) {
             KLOG_ERR("copy_to_user_error\n");
         }
-        KLOG_INFO("read => '%s'\n", local_buf);
+        KLOG_INFO("gpio_mode read => '%s'\n", local_buf);
         proc_read_gpio_mode_done = true;
         return minlen;
 }
@@ -559,15 +464,25 @@ static ssize_t fake_gpio_gpio_mode_read_proc(struct file *fp, char __user *buffe
 static ssize_t fake_gpio_gpio_mode_write_proc(struct file *fp, const char *buff, size_t len, loff_t * off)
 {
         char local_buf[16];
+        gpio_mode_t gpio_mode_tmp;
         if (copy_from_user(local_buf,buff,len) ) {
             KLOG_ERR("copy_to_user_error\n");
             return 0;
         }
-        if (sscanf(local_buf, "%d", (int *)(&gpio_mode)) != 1) {
-            KLOG_ERR("sscanf error\n");
-            return 0;
+
+        len = sscanf(local_buf,"%d",(int *)(&gpio_mode_tmp));
+        if (len != 1) {
+                KLOG_ERR("Bad gpio_mode '%s', not an integer\n", local_buf);
+                return EINVAL;
         }
-        KLOG_INFO("write => '%d'\n", gpio_mode);
+        if (!VALID_MODE(gpio_mode_tmp)) {
+                KLOG_ERR("Bad gpio_mode %d, out of range\n", gpio_mode_tmp);
+                return EINVAL;
+        }
+        gpio_mode = gpio_mode_tmp;
+        KLOG_INFO(" => '%d'\n", gpio_mode);
+
+        KLOG_INFO("gpio_mode write => '%d'\n", gpio_mode);
         return len;
 }
 
@@ -580,15 +495,16 @@ static long fake_gpio_byte_ioctl(struct file *file, unsigned int cmd, unsigned l
 
          switch(cmd) {
                 case IOCTL_GPIO_BYTES_FLUSH:
-                        mutex_lock(&buf_mutex);
-                        KLOG_INFO("IOCTL_GPIO_BYTES_FLUSH flushing buffer of %ld bytes...\n", byte_buf_count);
-                        byte_buffer_flush();
-                        mutex_unlock(&buf_mutex);
+                        mutex_lock(&byte_buf_mutex);
+                        KLOG_INFO("IOCTL_GPIO_BYTES_FLUSH flushing buffer of %ld bytes...\n", KCIRC_BUF_COUNT(&byte_buf));
+                        // byte_buffer_flush();
+                        kcirc_buf_flush(&byte_buf);
+                        mutex_unlock(&byte_buf_mutex);
                         break;
 
                 case IOCTL_GPIO_BYTES_COUNT:
-                        KLOG_INFO("IOCTL_GPIO_BYTES_COUNT read %ld", byte_buf_count);
-                        if( copy_to_user((size_t*) arg, &byte_buf_count, sizeof(byte_buf_count)) )
+                        KLOG_INFO("IOCTL_GPIO_BYTES_COUNT read %ld", KCIRC_BUF_COUNT(&byte_buf));
+                        if( copy_to_user((size_t*) arg, &(KCIRC_BUF_COUNT(&byte_buf)), sizeof(KCIRC_BUF_COUNT(&byte_buf))) )
                         {
                                 KLOG_ERR("ERROR copying to user\n");
                         }
@@ -638,6 +554,7 @@ static int __init fake_gpio_driver_init(void)
                 KLOG_ERR("Cannot allocate major number for %s\n", BYTE_BUF_DEV_NAME);
                 return -1;
         }
+        KLOG_INFO("Created chrdev_region %d:%d for %s", MAJOR(byte_dev), MINOR(byte_dev), BYTE_BUF_DEV_NAME);
  
         // Create char byte_dev struct
         cdev_init(&fake_gpio_byte_cdev,&byte_fops);
@@ -645,31 +562,23 @@ static int __init fake_gpio_driver_init(void)
             KLOG_ERR("Cannot add the %s device to the system\n", BYTE_BUF_DEV_NAME);
             goto destroy_chrdev_region1;
         }
+        KLOG_INFO("Created cdev struct for device %s\n", BYTE_BUF_DEV_NAME);
  
         // Create class
         if(IS_ERR(byte_dev_class = class_create(THIS_MODULE,BYTE_DEV_CLASS))){
             KLOG_ERR("Cannot create the struct class\n");
             goto destroy_chrdev_region1;
         }
- 
+         KLOG_INFO("Created class %s for device %s\n", BYTE_DEV_CLASS, BYTE_BUF_DEV_NAME);
+
         // Finally, create the device
         if(IS_ERR(device_create(byte_dev_class,NULL,byte_dev,NULL, BYTE_BUF_DEV_NAME))){
             KLOG_ERR("Cannot create the Device 1\n");
             goto destroy_class1;
         }
-        
-        // Alloc buffer for gpio bytes
-        // TODO - free up on failure
-        if((byte_buf = kmalloc(BYTE_BUF_SZ , GFP_KERNEL)) == 0){
-            KLOG_ERR("Cannot allocate memory in kernel\n");
-            goto destroy_class1;
-        }
-        byte_buf_head = byte_buf;
-        byte_buf_tail = byte_buf;
-        byte_buf_start = byte_buf;
-        byte_buf_end = byte_buf+BYTE_BUF_SZ-1;
-        KLOG_INFO("byte_buf_start=%p, byte_buf_end=%p, byte_buf_head=%p, byte_buf_tail=%p\n", byte_buf_start, byte_buf_end, byte_buf_head, byte_buf_tail);
-
+        KLOG_INFO("Created device %s\n", BYTE_BUF_DEV_NAME);
+       
+        KCIRC_BUF_ALLOC_AND_INIT(&byte_buf, BYTE_BUF_SZ);
         // Create sysfs directory in /sys/kernel/
         gpio_kobj = kobject_create_and_add(SYSFS_DIR,kernel_kobj);
  
@@ -679,7 +588,7 @@ static int __init fake_gpio_driver_init(void)
                 goto destroy_sysfs;
         }
  
-        // Create sysfs file node for byte_buf_count
+        // Create sysfs file node byte_buf
         if(sysfs_create_file(gpio_kobj,&buf_count_attr.attr)){
                 pr_err("Cannot create sysfs/buf_count file......\n");
                 goto destroy_sysfs;
@@ -719,74 +628,73 @@ static int __init fake_gpio_driver_init(void)
                 KLOG_ERR("Cannot allocate major number for %s\n", BIT_BUF_DEV_NAME);
                 goto destroy_proc_entry;
         }
- 
+         KLOG_INFO("Created chrdev_region %d:%d for %s", MAJOR(bit_dev), MINOR(bit_dev), BIT_BUF_DEV_NAME);
+
         // Create char bit_dev struct
         cdev_init(&fake_gpio_bit_cdev,&bit_fops);
          if((cdev_add(&fake_gpio_bit_cdev,bit_dev,1)) < 0){
             KLOG_ERR("Cannot add the %s device to the system\n", BIT_BUF_DEV_NAME);
             goto destroy_chrdev_region2;
         }
- 
+         KLOG_INFO("Created cdev struct for device %s\n", BIT_BUF_DEV_NAME);
+
         // Create class
         if(IS_ERR(bit_dev_class = class_create(THIS_MODULE,BIT_DEV_CLASS))){
             KLOG_ERR("Cannot create the struct class\n");
             goto destroy_chrdev_region2;
         }
- 
+          KLOG_INFO("Created class %s for device %s\n", BIT_DEV_CLASS, BIT_BUF_DEV_NAME);
+
         // Finally, create the device
         if(IS_ERR(device_create(bit_dev_class,NULL,bit_dev,NULL, BIT_BUF_DEV_NAME))){
             KLOG_ERR("Cannot create the Device 1\n");
             goto destroy_class2;
         }
+        KLOG_INFO("Created device %s\n", BYTE_BUF_DEV_NAME);
         
         // Alloc buffer for gpio
-        // TODO free up on failure
-        if((bit_buf = kmalloc(BIT_BUF_SZ , GFP_KERNEL)) == 0){
-            KLOG_ERR("Cannot allocate memory in kernel\n");
-            goto destroy_class2;
-        }
-        bit_buf_head = bit_buf;
-        bit_buf_tail = bit_buf;
-        bit_buf_start = bit_buf;
-        bit_buf_end = bit_buf+BYTE_BUF_SZ-1;
-        KLOG_INFO("bit_buf_start=%p, bit_buf_end=%p, bit_buf_head=%p, bit_buf_tail=%p\n", bit_buf_start, bit_buf_end, bit_buf_head, bit_buf_tail);
+        KCIRC_BUF_ALLOC_AND_INIT(&bit_buf, BIT_BUF_SZ);
 
         //================= START THREADS ======================
         // start buffer drain polling thread; only drains if mode is set appropriately
         KLOG_INFO("Creating drain_poll_loop_thread...\n");
         drain_poll_loop_thread = kthread_create(drain_buffer_poll_thread_fn,NULL,"drain_buffer_poll_thread_fn");
-        KLOG_INFO("waking up thread...\n");
+        KLOG_INFO("waking up drain_poll_loop_thread...\n");
         wake_up_process(drain_poll_loop_thread);
 
         // start buffer drain wait queue thread; only drains if mode is set appropriately
         KLOG_INFO("Creating drain_wait_loop_thread...\n");
         drain_wait_loop_thread = kthread_create(drain_buffer_wait_thread_fn,NULL,"drain_buffer_wait_thread_fn");
-        KLOG_INFO("waking up thread...\n");
+        KLOG_INFO("waking up drain_wait_loop_thread...\n");
         wake_up_process(drain_wait_loop_thread);
-    
-        KLOG_INFO("inserted device %s, class %s, MAJOR=%d, MINOR=%d sysfs=%s\n",
-                 BYTE_BUF_DEV_NAME, BYTE_DEV_CLASS, MAJOR(byte_dev), MINOR(byte_dev), SYSFS_DIR);
+        KLOG_INFO("Finished installing module!\n");
         return 0;
 
  
 destroy_class2:
+        KLOG_INFO("Removing class %s ... \n", BIT_DEV_CLASS);
         class_destroy(bit_dev_class);
 
 destroy_chrdev_region2:
+        KLOG_INFO("Unregistering device %s ... \n", BIT_BUF_DEV_NAME);
         unregister_chrdev_region(bit_dev,1);
 
 destroy_proc_entry:
+        KLOG_INFO("Removing /proc/%s ... \n", PROC_DIR);
         remove_proc_entry(PROC_BUF_COUNT_NAME, gpio_proc_root); 
 
 destroy_sysfs:
+        KLOG_INFO("Removing /sys/kernel/%s ... \n", SYSFS_DIR);
         kobject_put(gpio_kobj); 
         sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
         sysfs_remove_file(kernel_kobj, &buf_count_attr.attr);
 
 destroy_class1:
+        KLOG_INFO("Removing class %s ... \n", BYTE_DEV_CLASS);
         class_destroy(byte_dev_class);
 
 destroy_chrdev_region1:
+        KLOG_INFO("Unregistering device %s ... \n", BYTE_BUF_DEV_NAME);
         unregister_chrdev_region(byte_dev,1);
 
         return -1;
@@ -806,20 +714,23 @@ static void __exit fake_gpio_driver_exit(void)
                 kthread_stop(drain_wait_loop_thread);
         }
         
+        KLOG_INFO("Removing /sys/kernel/%s ... \n", SYSFS_DIR);
         kobject_put(gpio_kobj); 
+        KLOG_INFO("Removing /proc/%s ... \n", PROC_DIR);
         proc_remove(gpio_proc_root);
-        // remove_proc_entry(PROC_BUF_COUNT_NAME, gpio_proc_root); 
         sysfs_remove_file(kernel_kobj, &gpio_mode_attr.attr);
 
-	kfree(byte_buf);
+        KCIRC_BUF_DEALLOC(&byte_buf);
         device_destroy(byte_dev_class,byte_dev);
+        KLOG_INFO("Removing class %s ... \n", BYTE_DEV_CLASS);
         class_destroy(byte_dev_class);
         cdev_del(&fake_gpio_byte_cdev);
 
-        kfree(bit_buf);
+        KCIRC_BUF_DEALLOC(&bit_buf);
+        device_destroy(bit_dev_class,bit_dev);
+        KLOG_INFO("Removing class %s ... \n", BIT_DEV_CLASS);
         class_destroy(bit_dev_class);
         cdev_del(&fake_gpio_bit_cdev);
-        unregister_chrdev_region(bit_dev, 1);
 
         KLOG_INFO("device driver removed\n");
 }
